@@ -10,7 +10,7 @@ work_dir="."
 cd "$work_dir"
 
 # ── Dataset List & Scenario ───────────────────────────────────────────────
-DATASETS=( "goodreads")
+DATASETS=( "yelp")
 # DATASETS=("goodreads" "yelp" "amazon")
 SCENARIO="user_cold_start"
 # SCENARIO="classic"
