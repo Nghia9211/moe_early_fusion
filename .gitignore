@@ -25,3 +25,4 @@ scripts
 .env
 *.faiss
 *.pkl
+AFL2
