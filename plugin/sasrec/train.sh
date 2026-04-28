@@ -19,7 +19,7 @@ WEIGHT_DECAY=0.0001
 
 # 3. Danh sách các dataset muốn train lần lượt
 # DATASETS=( "yelp")
-DATASETS=("yelp") 
+DATASETS=("amazon") 
 
 echo "=========================================================="
 echo "🚀 BẮT ĐẦU QUÁ TRÌNH TRAINING SASREC"

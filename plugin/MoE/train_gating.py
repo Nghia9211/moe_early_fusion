@@ -1,23 +1,15 @@
 """
-moe_fusion/train_gating.py
-───────────────────────────
-MoE Gating Network Offline Training (V5.0 - KL-Divergence Loss)
-- Sử dụng Rich Text từ FAISS.
-- Min-Max Scaling cục bộ cho Semantic Signal.
-- KHÔNG dùng LLM Profiler lúc train.
-- Hỗ trợ 3 loss: bpr, bce, kl (mới).
-- KL loss: target gates = softmax(NDCG quality mỗi expert).
+train_gating.py — v2.1 (User-Context Gating, 5-feature)
+────────────────────────────────────────────────────────────────────
+Thay đổi so với v2.0:
+  - input_dim = 5  (bỏ cold_start_flag, gcn_coverage, seq_entropy)
+  - Thêm gcn_confidence + sem_confidence vào build_context_feature
+  - print_feature_report cập nhật labels
+  - Các tham số khác giữ nguyên (KL + entropy reg, balanced target)
 """
 
-import os
-import sys
-import argparse
-import math
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import os, sys, argparse, math, numpy as np, pandas as pd
+import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
@@ -25,501 +17,441 @@ from tqdm import tqdm
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
 root_dir    = os.path.dirname(parent_dir)
-sys.path.insert(0, parent_dir)
-sys.path.insert(0, root_dir)
+for p in [current_dir, parent_dir, root_dir, os.path.join(root_dir, 'baseline')]:
+    if p not in sys.path: sys.path.insert(0, p)
 
-baseline_dir = os.path.join(root_dir, 'baseline')
-if baseline_dir not in sys.path:
-    sys.path.insert(0, baseline_dir)
-    
-from config           import MoEConfig, GatingConfig, DEFAULT_CONFIG
-from gating_network   import GatingNetwork, GatingMLP
-from seq_scorer       import SeqScorer
-from gcn_scorer       import GCNScorer
-from semantic_scorer  import SemanticScorer
+from config          import MoEConfig, GatingConfig, DEFAULT_CONFIG
+from gating_network  import GatingMLP, GatingNetwork, extract_context_features
+from seq_scorer      import SeqScorer
+from gcn_scorer      import GCNScorer
+from semantic_scorer import SemanticScorer
 from dataset.general_dataset import GeneralDataset
 
-def compute_batch_scores_optimized(
-    batch_seqs,      
-    batch_lens,      
-    batch_queries,   
-    batch_pools,     
-    seq_scorer,
-    gcn_scorer,
-    sem_scorer,
-    id2name
-):
-    B = len(batch_seqs)
-    device = seq_scorer.device
-    
-    with torch.no_grad():
-        batch_logits = seq_scorer.model.forward_eval(batch_seqs, batch_lens.cpu().numpy()) 
-    
-    batch_gcn_scores = []
-    if gcn_scorer:
-        with torch.no_grad():
-            h_users = []
-            for i in range(B):
-                h_u = gcn_scorer._user_embedding(batch_seqs[i].tolist(), int(batch_lens[i]))
-                h_users.append(h_u if h_u is not None else torch.zeros(gcn_scorer.gcn_norm.shape[1], device=device))
-            h_users = torch.stack(h_users) 
-            all_gcn_logits = h_users @ gcn_scorer.gcn_norm.T 
-    
-    batch_sem_logits_map = [{} for _ in range(B)]
-    if sem_scorer and sem_scorer.embedding_function:
-        all_unique_names = set()
-        for pool in batch_pools:
-            for cid in pool:
-                all_unique_names.add(id2name.get(cid, f"item_{cid}"))
-        
-        unique_names_list = list(all_unique_names)
-        rich_texts_list = sem_scorer._get_candidate_texts(unique_names_list)
-        
-        q_vecs = np.array(sem_scorer.embedding_function.embed_documents(batch_queries), dtype=np.float32)
-        d_vecs = np.array(sem_scorer.embedding_function.embed_documents(rich_texts_list), dtype=np.float32) 
-        
-        q_vecs = q_vecs / (np.linalg.norm(q_vecs, axis=1, keepdims=True) + 1e-8)
-        d_vecs = d_vecs / (np.linalg.norm(d_vecs, axis=1, keepdims=True) + 1e-8)
-        sim_matrix = q_vecs @ d_vecs.T 
-        
-        name_to_idx = {name: idx for idx, name in enumerate(unique_names_list)}
-        for i in range(B):
-            raw_sims = []
-            pool_names = []
-            for cid in batch_pools[i]:
-                name = id2name.get(cid, f"item_{cid}")
-                pool_names.append(name)
-                raw_sims.append(sim_matrix[i, name_to_idx[name]])
-                
-            raw_sims = np.array(raw_sims)
-            min_s, max_s = float(raw_sims.min()), float(raw_sims.max())
-            if max_s > min_s:
-                norm_sims = (raw_sims - min_s) / (max_s - min_s)
-            else:
-                norm_sims = np.full_like(raw_sims, 0.5)
-                
-            for j, name in enumerate(pool_names):
-                batch_sem_logits_map[i][name] = float(np.clip(norm_sims[j], 0.0, 1.0))
 
-    final_scores = []
-    for i in range(B):
-        pool = batch_pools[i]
-        s_seq = _minmax_normalize({id2name[cid]: batch_logits[i, cid].item() for cid in pool if cid in id2name})
-        s_gcn = _minmax_normalize({id2name[cid]: all_gcn_logits[i, cid].item() for cid in pool if cid in id2name}) if gcn_scorer else {}
-        s_sem = _minmax_normalize(batch_sem_logits_map[i])
-        final_scores.append((s_seq, s_gcn, s_sem))
-        
-    return final_scores
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _minmax_normalize(score_dict: Dict[str, float]) -> Dict[str, float]:
-    if not score_dict: return {}
-    vals = np.array(list(score_dict.values()))
-    min_v, max_v = np.min(vals), np.max(vals)
-    if max_v == min_v:
-        return {k: 0.5 for k in score_dict}
-    return {k: float((v - min_v) / (max_v - min_v)) for k, v in score_dict.items()}
+# Feature labels khớp với v2.1
+FEATURE_LABELS = ['norm_seq_len', 'agree_gcn', 'agree_sem', 'gcn_confidence', 'sem_confidence']
 
-def _get_signal_features(item_name: str, seq_sc: Dict, gcn_sc: Dict, sem_sc: Dict, len_seq: int, use_seq_len: bool) -> List[float]:
-    features = [seq_sc.get(item_name, 0.0), gcn_sc.get(item_name, 0.0), sem_sc.get(item_name, 0.0)]
-    if use_seq_len:
-        norm_len = min(len_seq / 50.0, 1.0)
-        features.append(norm_len)
-    return features
 
-def _compute_expert_quality(gt_name: str, expert_scores: Dict[str, float]) -> float:
-    """Tính NDCG-style quality: expert rank GT item càng cao → quality càng lớn."""
-    if not expert_scores or gt_name not in expert_scores:
-        return 0.0
-    sorted_items = sorted(expert_scores, key=expert_scores.get, reverse=True)
-    rank = sorted_items.index(gt_name) + 1
+def _minmax(d: Dict[str, float]) -> Dict[str, float]:
+    if not d: return {}
+    vals = np.array(list(d.values()))
+    lo, hi = vals.min(), vals.max()
+    if hi == lo: return {k: 0.5 for k in d}
+    return {k: float((v - lo) / (hi - lo)) for k, v in d.items()}
+
+
+def _ndcg_quality(gt_name: str, scores: Dict[str, float]) -> float:
+    if not scores or gt_name not in scores: return 0.0
+    rank = sorted(scores, key=scores.get, reverse=True).index(gt_name) + 1
     return 1.0 / math.log2(rank + 1)
 
-def _sample_hard_negatives(gt_name, seq_sc, gcn_sc, sem_sc, all_names, n_neg, hard_ratio=0.5):
-    non_gt = [n for n in all_names if n != gt_name]
-    if not non_gt: return []
-    n_hard = max(1, int(n_neg * hard_ratio))
-    n_easy = n_neg - n_hard
-    top_k = max(n_neg, 10)
-    hard_pool = set()
-    for sc_dict in [seq_sc, gcn_sc, sem_sc]:
-        if sc_dict:
-            top_items = sorted([n for n in sc_dict if n != gt_name and n in set(non_gt)], 
-                               key=sc_dict.get, reverse=True)[:top_k]
-            hard_pool.update(top_items)
-    hard_pool = list(hard_pool)
-    np.random.shuffle(hard_pool)
-    hard_negs = hard_pool[:n_hard]
-    easy_pool = [n for n in non_gt if n not in set(hard_negs)]
-    np.random.shuffle(easy_pool)
-    easy_negs = easy_pool[:n_easy]
-    return hard_negs + easy_negs
 
-def print_feature_report(X: np.ndarray, name: str = "Data"):
-    print(f"\n=== Statistical Report for {name} (N={len(X)}) ===")
-    print(f"{'Signal':<12} | {'Mean':<8} | {'Std':<8} | {'% Non-Zero':<10}")
-    print("-" * 55)
-    
-    # Định nghĩa sẵn danh sách các tín hiệu (tối đa 4)
-    signals = ['Sequential', 'GCN', 'Semantic', 'Len_Seq']
-    
-    # Lấy số chiều thực tế của ma trận X (sẽ là 3 nếu chạy ablation, 4 nếu chạy gốc)
-    num_features = X.shape[1] 
-    
-    for i in range(num_features):
+def _softmax(arr: np.ndarray, temp: float) -> np.ndarray:
+    a = arr / max(temp, 1e-8)
+    a -= a.max()
+    e = np.exp(a)
+    return e / e.sum()
+
+
+def _balanced_target(q_arr: np.ndarray, temp: float, balance_eps: float = 0.05) -> np.ndarray:
+    """
+    Nếu expert quality tương đương nhau (max - min < balance_eps),
+    trả về [1/3, 1/3, 1/3] thay vì winner-takes-all.
+    """
+    if q_arr.max() - q_arr.min() < balance_eps:
+        return np.array([1/3, 1/3, 1/3], dtype=np.float32)
+    return _softmax(q_arr, temp).astype(np.float32)
+
+
+def build_context_feature(
+    seq: List[int], len_seq: int,
+    seq_sc: Dict, gcn_sc: Dict, sem_sc: Dict,
+    gcn_norm, cfg: GatingConfig,
+) -> List[float]:
+    """Wrapper gọi extract_context_features từ gating_network.py (5-feature v2.1)."""
+    return extract_context_features(
+        seq=seq, len_seq=len_seq,
+        seq_scores=seq_sc, gcn_scores=gcn_sc, sem_scores=sem_sc,
+        gcn_norm=gcn_norm,   # không dùng trong v2.1, passed for API compat
+        cfg=cfg,
+    )
+
+
+def print_feature_report(X: np.ndarray):
+    print(f"\n{'Signal':<18} | {'Mean':>7} | {'Std':>7} | {'%NonZero':>9}")
+    print('-' * 54)
+    for i in range(X.shape[1]):
         col = X[:, i]
-        non_zero = (np.abs(col) > 1e-9).mean() * 100
-        print(f"{signals[i]:<12} | {col.mean():.4f} | {col.std():.4f} | {non_zero:>9.2f}%")
+        nz  = (np.abs(col) > 1e-9).mean() * 100
+        lbl = FEATURE_LABELS[i] if i < len(FEATURE_LABELS) else f'f{i}'
+        print(f"{lbl:<18} | {col.mean():>7.4f} | {col.std():>7.4f} | {nz:>8.1f}%")
 
-def build_training_data_fast(
-    loader:     DataLoader,
-    seq_scorer: SeqScorer,
-    gcn_scorer: Optional[GCNScorer],
-    sem_scorer: Optional[SemanticScorer],
-    id2name:    Dict[int, str],
-    cfg: GatingConfig,
-    n_neg:      int = 5,
-    hard_ratio: float = 0.5,
-    mode:       str = 'bpr'
-) -> Tuple:
-    X_list, y_list, X_pos_list, X_neg_list = [], [], [], []
-    pbar = tqdm(loader, desc=f"🚀 Building {mode.upper()} Data", total=len(loader), unit="batch")
 
-    for batch in pbar:
-        seqs = batch['seq'].to(seq_scorer.device)
-        lens = batch['len_seq'].to(seq_scorer.device)
-        next_ids = batch['next'].cpu().numpy()
-        all_cans_batch = batch.get('cans')
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch score computation  (unchanged from v2.0)
+# ─────────────────────────────────────────────────────────────────────────────
 
-        batch_pools, batch_queries = [], []
-        for i in range(len(next_ids)):
-            gt_id = int(next_ids[i])
-            cans = all_cans_batch[i].tolist() if all_cans_batch is not None else []
-            pool = list(set(cans) | {gt_id})
-            batch_pools.append(pool)
-            
-            seq_str = ' '.join(id2name[iid] for iid in seqs[i].tolist() if iid in id2name)
-            query = f"User interested in: {seq_str}"
-            batch_queries.append(query)
+def compute_batch_scores(batch_seqs, batch_lens, batch_pools,
+                         seq_scorer, gcn_scorer, sem_scorer, id2name, device):
+    B = len(batch_seqs)
+    with torch.no_grad():
+        all_logits = seq_scorer.model.forward_eval(batch_seqs, batch_lens.cpu().numpy())
 
-        batch_results = compute_batch_scores_optimized(
-            seqs, lens, batch_queries, batch_pools, 
-            seq_scorer, gcn_scorer, sem_scorer, id2name
-        )
+    h_users = None
+    if gcn_scorer:
+        hl = []
+        for i in range(B):
+            h = gcn_scorer._user_embedding(batch_seqs[i].tolist(), int(batch_lens[i]))
+            hl.append(h if h is not None
+                      else torch.zeros(gcn_scorer.gcn_norm.shape[1], device=device))
+        h_users = torch.stack(hl)
 
-        for i in range(len(next_ids)):
-            gt_id = int(next_ids[i])
-            gt_name = id2name.get(gt_id)
-            if not gt_name: continue
-            
-            s_seq, s_gcn, s_sem = batch_results[i]
-            pos_feat = _get_signal_features(gt_name, s_seq, s_gcn, s_sem, int(lens[i]), cfg.use_seq_len_in_gating)
-            
-            all_pool_names = [id2name[cid] for cid in batch_pools[i] if cid in id2name]
-            neg_names = _sample_hard_negatives(gt_name, s_seq, s_gcn, s_sem, all_pool_names, n_neg, hard_ratio)
-            
-            if mode == 'bce':
-                X_list.append(pos_feat)
-                y_list.append(1.0)
-                for n_name in neg_names:
-                    X_list.append(_get_signal_features(n_name, s_seq, s_gcn, s_sem, int(lens[i]), cfg.use_seq_len_in_gating))
-                    y_list.append(0.0)
-            else: 
-                for n_name in neg_names:
-                    X_pos_list.append(pos_feat)
-                    X_neg_list.append(_get_signal_features(n_name, s_seq, s_gcn, s_sem, int(lens[i]), cfg.use_seq_len_in_gating))
+    sem_map = [{} for _ in range(B)]
+    if sem_scorer and sem_scorer.embedding_function:
+        all_unique = set()
+        for pool in batch_pools:
+            all_unique.update(id2name.get(cid, f'item_{cid}') for cid in pool)
+        unique_list = list(all_unique)
+        rich   = sem_scorer._get_candidate_texts(unique_list)
+        q_strs = [
+            'User interested in: ' + ' '.join(
+                id2name.get(iid, '') for iid in batch_seqs[i].tolist() if iid in id2name
+            )
+            for i in range(B)
+        ]
+        q_vecs = np.array(sem_scorer.embedding_function.embed_documents(q_strs), dtype=np.float32)
+        d_vecs = np.array(sem_scorer.embedding_function.embed_documents(rich),   dtype=np.float32)
+        q_vecs /= (np.linalg.norm(q_vecs, axis=1, keepdims=True) + 1e-8)
+        d_vecs /= (np.linalg.norm(d_vecs, axis=1, keepdims=True) + 1e-8)
+        sim  = q_vecs @ d_vecs.T
+        n2i  = {n: i for i, n in enumerate(unique_list)}
+        for i, pool in enumerate(batch_pools):
+            raw = {
+                id2name[c]: sim[i, n2i[id2name[c]]]
+                for c in pool
+                if c in id2name and id2name[c] in n2i
+            }
+            sem_map[i] = _minmax(raw)
 
-        total_so_far = len(X_list) if mode == 'bce' else len(X_pos_list)
-        pbar.set_postfix({"samples": f"{total_so_far:,}"})
-    pbar.close()
+    results = []
+    for i in range(B):
+        pool  = batch_pools[i]
+        s_seq = _minmax({id2name[c]: all_logits[i, c].item() for c in pool if c in id2name})
+        s_gcn = {}
+        if h_users is not None:
+            can_ids = torch.tensor([c for c in pool if c < gcn_scorer.num_items], device=device)
+            if len(can_ids):
+                sims  = (gcn_scorer.gcn_norm[can_ids] @ h_users[i]).cpu().tolist()
+                s_gcn = _minmax({
+                    id2name[c.item()]: s
+                    for c, s in zip(can_ids, sims)
+                    if c.item() in id2name
+                })
+        results.append((s_seq, s_gcn, sem_map[i]))
+    return results
 
-    if mode == 'bce': return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
-    return np.array(X_pos_list, dtype=np.float32), np.array(X_neg_list, dtype=np.float32)
 
-def build_training_data_kl(
-    loader:     DataLoader,
-    seq_scorer: SeqScorer,
-    gcn_scorer: Optional[GCNScorer],
-    sem_scorer: Optional[SemanticScorer],
-    id2name:    Dict[int, str],
-    cfg:        GatingConfig,
-    temperature: float = 2.0,
-) -> Tuple:
-    """Build (X_features, Y_target_gates) for KL-Divergence training."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Build training data — 5-feature context + KL target
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_training_data_context(
+    loader, seq_scorer, gcn_scorer, sem_scorer,
+    id2name, cfg: GatingConfig,
+    temperature:  float = 2.0,
+    balance_eps:  float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+        X : (N, 5) context features
+        Y : (N, 3) KL target gate distribution
+    """
     X_list, Y_list = [], []
-    pbar = tqdm(loader, desc="🚀 Building KL Data", total=len(loader), unit="batch")
+    gcn_norm = gcn_scorer.gcn_norm if gcn_scorer else None
+    device   = seq_scorer.device
 
+    pbar = tqdm(loader, desc='Building Context Training Data', unit='batch')
     for batch in pbar:
-        seqs = batch['seq'].to(seq_scorer.device)
-        lens = batch['len_seq'].to(seq_scorer.device)
+        seqs     = batch['seq'].to(device)
+        lens     = batch['len_seq'].to(device)
         next_ids = batch['next'].cpu().numpy()
-        all_cans_batch = batch.get('cans')
+        cans_t   = batch.get('cans')
 
-        batch_pools, batch_queries = [], []
+        batch_pools = []
         for i in range(len(next_ids)):
             gt_id = int(next_ids[i])
-            cans = all_cans_batch[i].tolist() if all_cans_batch is not None else []
-            pool = list(set(cans) | {gt_id})
-            batch_pools.append(pool)
-            seq_str = ' '.join(id2name[iid] for iid in seqs[i].tolist() if iid in id2name)
-            batch_queries.append(f"User interested in: {seq_str}")
+            cans  = cans_t[i].tolist() if cans_t is not None else []
+            batch_pools.append(list(set(cans) | {gt_id}))
 
-        batch_results = compute_batch_scores_optimized(
-            seqs, lens, batch_queries, batch_pools,
-            seq_scorer, gcn_scorer, sem_scorer, id2name
+        results = compute_batch_scores(
+            seqs, lens, batch_pools,
+            seq_scorer, gcn_scorer, sem_scorer, id2name, device,
         )
 
         for i in range(len(next_ids)):
-            gt_id = int(next_ids[i])
+            gt_id   = int(next_ids[i])
             gt_name = id2name.get(gt_id)
-            if not gt_name: continue
+            if not gt_name:
+                continue
 
-            s_seq, s_gcn, s_sem = batch_results[i]
+            s_seq, s_gcn, s_sem = results[i]
+            len_seq_i = int(lens[i])
+            seq_list  = seqs[i].tolist()
 
-            # Compute quality of each expert for this sample
-            q_seq = _compute_expert_quality(gt_name, s_seq)
-            q_gcn = _compute_expert_quality(gt_name, s_gcn) if s_gcn else 0.0
-            q_sem = _compute_expert_quality(gt_name, s_sem) if s_sem else 0.0
+            # ── 5-feature context vector ─────────────────────────────────────
+            ctx = build_context_feature(
+                seq_list, len_seq_i, s_seq, s_gcn, s_sem, gcn_norm, cfg
+            )
 
-            # Target gate = softmax([q_seq, q_gcn, q_sem] / temperature)
+            # ── KL target: NDCG quality per expert ──────────────────────────
+            q_seq = _ndcg_quality(gt_name, s_seq)
+            q_gcn = _ndcg_quality(gt_name, s_gcn) if s_gcn else 0.0
+            q_sem = _ndcg_quality(gt_name, s_sem) if s_sem else 0.0
             q_arr = np.array([q_seq, q_gcn, q_sem], dtype=np.float32)
-            q_arr = q_arr / max(temperature, 1e-8)
-            exp_q = np.exp(q_arr - q_arr.max())  # numerically stable
-            target_gate = exp_q / exp_q.sum()
 
-            feat = _get_signal_features(gt_name, s_seq, s_gcn, s_sem, int(lens[i]), cfg.use_seq_len_in_gating)
-            X_list.append(feat)
+            target_gate = _balanced_target(q_arr, temperature, balance_eps)
+
+            X_list.append(ctx)
             Y_list.append(target_gate)
 
-        pbar.set_postfix({"samples": f"{len(X_list):,}"})
+        pbar.set_postfix({'N': len(X_list)})
     pbar.close()
 
     return np.array(X_list, dtype=np.float32), np.array(Y_list, dtype=np.float32)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalization
+# ─────────────────────────────────────────────────────────────────────────────
+
 def normalize_features(X: np.ndarray):
     mu  = X.mean(axis=0)
     std = X.std(axis=0)
-    std[std == 0] = 1.0
+    std[std == 0] = 1.0        # constant features → keep as-is (shouldn't happen in v2.1)
     return (X - mu) / std, mu, std
 
-def train_gating_kl(X, Y_target, cfg, device, val_ratio=0.1):
-    """Train Gating MLP with KL-Divergence loss against NDCG-based target gates."""
-    n = len(X)
-    n_val = max(1, int(n * val_ratio))
-    idx = np.random.permutation(n)
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
 
-    X_tr, Y_tr = X[train_idx], Y_target[train_idx]
-    X_vl, Y_vl = X[val_idx], Y_target[val_idx]
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
 
-    ds = TensorDataset(torch.tensor(X_tr, dtype=torch.float32), torch.tensor(Y_tr, dtype=torch.float32))
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+def train_gating_context(
+    X:        np.ndarray,
+    Y_target: np.ndarray,
+    cfg:      GatingConfig,
+    device:   torch.device,
+    val_ratio: float = 0.1,
+) -> GatingMLP:
+    """
+    Train GatingMLP với KL-Divergence loss + Entropy regularization.
 
-    model = GatingMLP(cfg).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-    X_vl_t = torch.tensor(X_vl, dtype=torch.float32).to(device)
-    Y_vl_t = torch.tensor(Y_vl, dtype=torch.float32).to(device)
-
-    kl_loss_fn = nn.KLDivLoss(reduction='batchmean')
-
-    best_val, best_state = float('inf'), None
-
-    for epoch in range(cfg.epochs):
-        model.train()
-        total = 0.0
-        for x_batch, y_batch in loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            pred_gates = model(x_batch)  # softmax output
-            # KL(target || predicted) — target is the "true" distribution
-            loss = kl_loss_fn(pred_gates.log().clamp(min=-100), y_batch)
-            loss.backward()
-            optimizer.step()
-            total += loss.item()
-
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(X_vl_t)
-            val_loss = kl_loss_fn(val_pred.log().clamp(min=-100), Y_vl_t).item()
-
-        if val_loss < best_val:
-            best_val = val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-
-        if (epoch + 1) % 5 == 0:
-            avg_train = total / max(len(loader), 1)
-            with torch.no_grad():
-                avg_g = model(X_vl_t).cpu().numpy().mean(axis=0)
-            print(f"  [KL] Epoch {epoch+1:02d}/{cfg.epochs} | train={avg_train:.4f} | val={val_loss:.4f} | "
-                  f"avg_gates: seq={avg_g[0]:.3f} gcn={avg_g[1]:.3f} sem={avg_g[2]:.3f}")
-
-    if best_state: model.load_state_dict(best_state)
-    print(f"Best KL val loss: {best_val:.4f}")
-
-    # Print target gate distribution for reference
-    print(f"\n📊 Target gate distribution (from NDCG quality):")
-    print(f"  avg_target: seq={Y_target[:,0].mean():.3f} gcn={Y_target[:,1].mean():.3f} sem={Y_target[:,2].mean():.3f}")
-    return model
-
-def train_gating_bpr(X_pos, X_neg, cfg, device, val_ratio=0.1):
-    n = len(X_pos)
+    Loss = KL(target || predicted) - entropy_weight * H(predicted)
+    Entropy bonus buộc gates phân tán, tránh collapse về 1 expert.
+    """
+    n     = len(X)
     n_val = max(1, int(n * val_ratio))
     idx   = np.random.permutation(n)
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
+    v_idx, t_idx = idx[:n_val], idx[n_val:]
 
-    Xp_tr, Xn_tr = X_pos[train_idx], X_neg[train_idx]
-    Xp_vl, Xn_vl = X_pos[val_idx],   X_neg[val_idx]
-
-    ds     = TensorDataset(torch.tensor(Xp_tr, dtype=torch.float32), torch.tensor(Xn_tr, dtype=torch.float32))
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+    ds     = TensorDataset(
+        torch.tensor(X[t_idx],        dtype=torch.float32),
+        torch.tensor(Y_target[t_idx], dtype=torch.float32),
+    )
+    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
 
     model     = GatingMLP(cfg).to(device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-5)
 
-    Xp_vl_t = torch.tensor(Xp_vl, dtype=torch.float32).to(device)
-    Xn_vl_t = torch.tensor(Xn_vl, dtype=torch.float32).to(device)
+    X_vl = torch.tensor(X[v_idx],        dtype=torch.float32).to(device)
+    Y_vl = torch.tensor(Y_target[v_idx], dtype=torch.float32).to(device)
 
-    def bpr_loss(gates_pos, x_pos, gates_neg, x_neg):
-        s_pos = (gates_pos * x_pos[:, :3]).sum(dim=-1)
-        s_neg = (gates_neg * x_neg[:, :3]).sum(dim=-1)
-        return -torch.log(torch.sigmoid(s_pos - s_neg) + 1e-8).mean()
+    kl_fn = nn.KLDivLoss(reduction='batchmean')
+    ent_w = getattr(cfg, 'entropy_reg_weight', 0.15)
 
     best_val, best_state = float('inf'), None
 
     for epoch in range(cfg.epochs):
         model.train()
-        total = 0.0
-        for xp, xn in loader:
-            xp, xn = xp.to(device), xn.to(device)
+        total_loss = 0.0
+        for x_b, y_b in loader:
+            x_b, y_b = x_b.to(device), y_b.to(device)
             optimizer.zero_grad()
-            loss = bpr_loss(model(xp), xp, model(xn), xn)
+            gates = model(x_b)                              # (B, 3) — softmax
+
+            kl   = kl_fn(gates.log().clamp(min=-100), y_b)
+            H    = -(gates * gates.log().clamp(min=-100)).sum(dim=-1).mean()
+            loss = kl - ent_w * H
+
             loss.backward()
             optimizer.step()
-            total += loss.item()
+            total_loss += loss.item()
+        scheduler.step()
 
         model.eval()
         with torch.no_grad():
-            val_loss = bpr_loss(model(Xp_vl_t), Xp_vl_t, model(Xn_vl_t), Xn_vl_t).item()
+            vl_gates = model(X_vl)
+            vl_kl    = kl_fn(vl_gates.log().clamp(min=-100), Y_vl).item()
+            vl_H     = -(vl_gates * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
+            val_loss = vl_kl - ent_w * vl_H
 
         if val_loss < best_val:
             best_val   = val_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-        if (epoch + 1) % 5 == 0:
-            print(f"  [BPR] Epoch {epoch+1:02d}/{cfg.epochs} | train={total/max(len(loader),1):.4f} | val={val_loss:.4f}")
+        if (epoch + 1) % 10 == 0:
+            avg_g = model(X_vl).mean(dim=0).detach().cpu().numpy()
+            print(f'  Epoch {epoch+1:03d}/{cfg.epochs} | '
+                  f'train={total_loss / max(len(loader), 1):.4f} | val={val_loss:.4f} | '
+                  f'gates: seq={avg_g[0]:.3f} gcn={avg_g[1]:.3f} sem={avg_g[2]:.3f}')
 
-    if best_state: model.load_state_dict(best_state)
-    print(f"Best BPR val loss: {best_val:.4f}")
+    if best_state:
+        model.load_state_dict(best_state)
+
+    # Final distribution stats
+    model.eval()
+    with torch.no_grad():
+        all_x = torch.tensor(X, dtype=torch.float32).to(device)
+        avg_g = model(all_x).detach().cpu().numpy()
+
+    print(f'\n📊 Final avg gates on ALL data:')
+    print(f'   seq={avg_g[:,0].mean():.3f}±{avg_g[:,0].std():.3f} | '
+          f'gcn={avg_g[:,1].mean():.3f}±{avg_g[:,1].std():.3f} | '
+          f'sem={avg_g[:,2].mean():.3f}±{avg_g[:,2].std():.3f}')
+    print(f'\n📊 Target gate distribution (mean):')
+    print(f'   seq={Y_target[:,0].mean():.3f} | '
+          f'gcn={Y_target[:,1].mean():.3f} | '
+          f'sem={Y_target[:,2].mean():.3f}')
+    print(f'\nBest val loss: {best_val:.4f}')
     return model
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="Train MoE Gating Network")
-    parser.add_argument('--data_dir',   required=True)
-    parser.add_argument('--model_path', required=True, help="SASRec checkpoint")
-    parser.add_argument('--gcn_path',   default=None)
-    parser.add_argument('--faiss_path', default=None)
-    parser.add_argument('--output_dir', default='./saved_models/moe')
-    parser.add_argument('--dataset',    default='amazon', choices=['amazon', 'yelp', 'goodreads'])
-    parser.add_argument('--epochs',     type=int,   default=30)
-    parser.add_argument('--lr',         type=float, default=1e-3)
-    parser.add_argument('--batch_size', type=int,   default=256)
-    parser.add_argument('--n_neg',      type=int,   default=5)
-    parser.add_argument('--hard_ratio', type=float, default=0.3)
-    parser.add_argument('--loss',       default='kl', choices=['bce', 'bpr', 'kl'])
-    parser.add_argument('--kl_temp',    type=float, default=2.0, help="Temperature cho softmax target gates trong KL loss (thấp=sharp, cao=smooth)")
-    parser.add_argument('--split',      default='val', choices=['train', 'val', 'test'])
-    parser.add_argument('--no_seq_len', action='store_true', help="Tắt việc dùng độ dài chuỗi (seq_len) trong mạng Gating (chuyển input_dim từ 4 xuống 3)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir',    required=True)
+    parser.add_argument('--model_path',  required=True)
+    parser.add_argument('--gcn_path',    default=None)
+    parser.add_argument('--faiss_path',  default=None)
+    parser.add_argument('--output_dir',  default='./saved_models/moe')
+    parser.add_argument('--dataset',     default='amazon', choices=['amazon', 'yelp', 'goodreads'])
+    parser.add_argument('--epochs',      type=int,   default=50)
+    parser.add_argument('--lr',          type=float, default=1e-3)
+    parser.add_argument('--batch_size',  type=int,   default=256)
+    parser.add_argument('--kl_temp',     type=float, default=2.0)
+    parser.add_argument('--balance_eps', type=float, default=0.05,
+                        help='Nếu max-min quality < eps → equal target gates')
+    parser.add_argument('--entropy_reg', type=float, default=0.15)
+    parser.add_argument('--split',       default='val', choices=['train', 'val', 'test'])
+    parser.add_argument('--hidden_size', type=int,   default=64)
+    parser.add_argument('--embed_model', default='sentence-transformers/all-MiniLM-L6-v2')
     args = parser.parse_args()
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[train_gating] Device={device} | dataset={args.dataset}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'[train_gating v2.1] Device={device} | dataset={args.dataset} | split={args.split}')
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # ── Load SASRec ──────────────────────────────────────────────────────────
     from utils.model import SASRec
     data_statis = pd.read_pickle(os.path.join(args.data_dir, 'data_statis.df'))
     seq_size, item_num = data_statis['seq_size'][0], data_statis['item_num'][0]
-
-    ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
-    hidden_size = ckpt.get('hidden_size', getattr(args, 'hidden_size', 64)) if isinstance(ckpt, dict) else getattr(args, 'hidden_size', 64)
-    sasrec = SASRec(hidden_size, item_num, seq_size, 0.1, device).to(device)
+    ckpt      = torch.load(args.model_path, map_location=device, weights_only=False)
+    hidden_sz = ckpt.get('hidden_size', args.hidden_size) if isinstance(ckpt, dict) else args.hidden_size
+    sasrec    = SASRec(hidden_sz, item_num, seq_size, 0.1, device).to(device)
     sasrec.load_state_dict(ckpt.get('model_state_dict', ckpt))
     sasrec.eval()
 
-    id2name, name2id = {}, {}
+    id2name: Dict[int, str] = {}
     with open(os.path.join(args.data_dir, 'id2name.txt'), encoding='utf-8') as f:
         for line in f:
             ll = line.strip().split('::', 1)
-            if len(ll) == 2: id2name[int(ll[0])] = ll[1].strip()
+            if len(ll) == 2:
+                id2name[int(ll[0])] = ll[1].strip()
 
-    shared = {'model': sasrec, 'id2name': id2name, 'name2id': name2id, 'item_num': item_num, 'device': device}
+    shared = {
+        'model': sasrec, 'id2name': id2name, 'name2id': {},
+        'item_num': item_num, 'device': device,
+    }
     seq_scorer = SeqScorer.from_shared(shared)
 
+    # ── GCN ─────────────────────────────────────────────────────────────────
     gcn_scorer = None
     if args.gcn_path and os.path.exists(args.gcn_path):
         shared['gcn_embeddings'] = torch.load(args.gcn_path, map_location=device, weights_only=True)
         gcn_scorer = GCNScorer.from_shared(shared)
+        print(f'[train_gating] GCN loaded: {gcn_scorer.num_items} items')
 
+    # ── Semantic ─────────────────────────────────────────────────────────────
     sem_scorer = None
     if args.faiss_path and os.path.exists(args.faiss_path):
         from langchain_huggingface import HuggingFaceEmbeddings
         from langchain_community.vectorstores import FAISS
-        embed_fn = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vs = FAISS.load_local(folder_path=args.faiss_path, embeddings=embed_fn, allow_dangerous_deserialization=True)
+        embed_fn  = HuggingFaceEmbeddings(model_name=args.embed_model)
+        vs        = FAISS.load_local(
+            folder_path=args.faiss_path, embeddings=embed_fn,
+            allow_dangerous_deserialization=True,
+        )
         shared.update({'vector_store': vs, 'embedding_function': embed_fn})
         sem_scorer = SemanticScorer.from_shared(shared)
+        print('[train_gating] Semantic FAISS loaded')
 
-    class DatasetArgs:
-        def __init__(self, data_dir): self.data_dir = data_dir
-    dataset = GeneralDataset(DatasetArgs(args.data_dir), stage={'train':'train','val':'valid','test':'test'}[args.split])
-    loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    # ── Dataset ──────────────────────────────────────────────────────────────
+    class _Args:
+        def __init__(self, d): self.data_dir = d
 
-    use_seq_len = not args.no_seq_len 
-    input_dimension = 4 if use_seq_len else 3
+    dataset = GeneralDataset(
+        _Args(args.data_dir),
+        stage={'train': 'train', 'val': 'val', 'test': 'test'}[args.split],
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
+    # ── GatingConfig v2.1 ────────────────────────────────────────────────────
     cfg = GatingConfig(
-        epochs=args.epochs, 
-        lr=args.lr, 
-        batch_size=args.batch_size,
-        use_seq_len_in_gating=use_seq_len,
-        input_dim=input_dimension
+        input_dim          = 5,            # ← v2.1: 5 features
+        hidden_dims        = [32, 16],
+        dropout            = 0.2,
+        epochs             = args.epochs,
+        lr                 = args.lr,
+        batch_size         = args.batch_size,
+        gating_mode        = 'context',
+        entropy_reg_weight = args.entropy_reg,
     )
 
-    if args.loss == 'kl':
-        X_raw, Y_target = build_training_data_kl(
-            loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
-            cfg=cfg, temperature=args.kl_temp
-        )
-        print_feature_report(X_raw, "Raw KL Features")
-        X_norm, mu, std = normalize_features(X_raw)
-        trained_mlp = train_gating_kl(X_norm, Y_target, cfg, device)
-        eval_X = torch.tensor(X_norm, dtype=torch.float32).to(device)
+    # ── Build training data ──────────────────────────────────────────────────
+    print('\n📦 Building context training data (5-feature v2.1)...')
+    X_raw, Y_target = build_training_data_context(
+        loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
+        cfg=cfg, temperature=args.kl_temp, balance_eps=args.balance_eps,
+    )
+    print(f'Training samples: {len(X_raw):,}')
+    print_feature_report(X_raw)
 
-    elif args.loss == 'bpr':
-        X_pos, X_neg = build_training_data_fast(
-            loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
-            cfg=cfg, n_neg=args.n_neg, hard_ratio=args.hard_ratio, mode='bpr'
-        )
-        X_all_n, mu, std = normalize_features(np.vstack([X_pos, X_neg]))
-        X_pos_n, X_neg_n = X_all_n[:len(X_pos)], X_all_n[len(X_pos):]
-        print_feature_report(X_pos, "Raw Positive Features")
-        trained_mlp = train_gating_bpr(X_pos_n, X_neg_n, cfg, device)
-        eval_X = torch.tensor(X_pos_n, dtype=torch.float32).to(device)
+    X_norm, mu, std = normalize_features(X_raw)
 
-    else:
-        raise ValueError(f"Unsupported loss: {args.loss}")
+    # ── Train ────────────────────────────────────────────────────────────────
+    print('\n🚀 Training GatingMLP v2.1 (5-feature context-mode)...')
+    trained_mlp = train_gating_context(X_norm, Y_target, cfg, device)
 
-    out_path = os.path.join(args.output_dir, f"{args.dataset}_gating_model.pt")
+    # ── Save ─────────────────────────────────────────────────────────────────
+    out_path = os.path.join(args.output_dir, f'{args.dataset}_gating_model.pt')
     torch.save({
         'model_state_dict': trained_mlp.state_dict(),
-        'cfg': cfg,
-        'norm_min': mu.tolist(),
-        'norm_max': std.tolist(),
+        'cfg':              cfg,
+        'norm_mean':        mu.tolist(),
+        'norm_std':         std.tolist(),
+        'gating_mode':      'context',
+        'feature_version':  'v2.1',
+        'feature_names':    FEATURE_LABELS,
     }, out_path)
-    print(f"\n✅ Gating model saved to {out_path}")
+    print(f'\n✅ Saved → {out_path}')
 
-    with torch.no_grad(): avg_g = trained_mlp(eval_X).cpu().numpy().mean(axis=0)
-    print(f"\nAverage gate weights on training set:")
-    print(f"  g1(seq) = {avg_g[0]:.3f} | g2(gcn) = {avg_g[1]:.3f} | g3(sem) = {avg_g[2]:.3f}")
 
 if __name__ == '__main__':
     main()

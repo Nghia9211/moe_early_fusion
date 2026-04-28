@@ -120,7 +120,9 @@ class MoERecAgent:
             use_semantic=self.cfg.use_semantic and self.vector_store is not None,
         )
         self.gating = GatingNetwork(cfg=self.cfg.gating, model_path=getattr(self.args, 'gating_model_path', self.cfg.gating_model_path), device=self.device)
-        self.fuser = MoEFusion(gating=self.gating, cfg=self.cfg)
+        # Truyền gcn_norm vào MoEFusion để tính gcn_coverage feature trong context-gating
+        gcn_norm_ref = self.gcn_scorer.gcn_norm if self.gcn_scorer is not None else None
+        self.fuser = MoEFusion(gating=self.gating, cfg=self.cfg, gcn_norm=gcn_norm_ref)
         self.reranker = Reranker.from_shared(shared=shared, llm=self.llm, mode=getattr(self.args, 'reranker_mode', 'embed_only'), enabled=self.cfg.use_reranker, top_llm=getattr(self.args, 'reranker_top_llm', 15))
         self.combiner = ScoreCombiner(cfg=self.cfg.scoring)
 

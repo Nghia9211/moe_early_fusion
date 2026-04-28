@@ -25,18 +25,43 @@ class RetrievalConfig:
 
 @dataclass
 class GatingConfig:
-    """Config cho MLP gating network."""
-    input_dim:    int   = 4
-    hidden_dims:  list  = field(default_factory=lambda: [16, 8])
-    dropout:      float = 0.1
+    """Config cho MLP gating network.
+    
+    gating_mode:
+      'context'  — input là user-context features (v2, mặc định mới)
+      'score'    — input là expert scores của item (v1 cũ, bị bias)
+    
+    Context features (khi mode='context', input_dim=6):
+      0: norm_seq_len         — len_seq / max_seq_len
+      1: cold_start_flag      — 1 nếu len_seq <= cold_threshold
+      2: gcn_coverage         — tỉ lệ items trong history có GCN embedding
+      3: seq_score_entropy    — entropy phân phối điểm SASRec trên candidates
+      4: expert_agreement_gcn — Spearman rank correlation seq vs gcn
+      5: expert_agreement_sem — Spearman rank correlation seq vs sem
+    """
+    input_dim:    int   = 6         # 6 context features
+    hidden_dims:  list  = field(default_factory=lambda: [32, 16])
+    dropout:      float = 0.2
     lr:           float = 1e-3
-    epochs:       int   = 30
+    epochs:       int   = 50
     batch_size:   int   = 256
     weight_decay: float = 1e-4
 
     default_weights: list = field(
         default_factory=lambda: [1/3, 1/3, 1/3]
     )
+    
+    # Gating mode
+    gating_mode:   str   = 'context'   # 'context' | 'score'
+    
+    # Entropy regularization — buộc gates phân tán
+    entropy_reg_weight: float = 0.15
+    
+    # Context feature thresholds
+    max_seq_len:       int   = 50
+    cold_threshold:    int   = 5
+    
+    # Legacy compat
     use_seq_len_in_gating: bool = False
 
 
@@ -63,9 +88,9 @@ class MoEConfig:
 
     gating_model_path: str = None
 
-    use_seq:      bool = True
+    use_seq:      bool = False
     use_gcn:      bool = False
-    use_semantic: bool = False
+    use_semantic: bool = True
     use_reranker: bool = False
 
 

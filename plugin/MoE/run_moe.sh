@@ -10,10 +10,10 @@ work_dir="."
 cd "$work_dir"
 
 # ── Dataset List & Scenario ───────────────────────────────────────────────
-DATASETS=( "yelp")
+DATASETS=( "goodreads")
 # DATASETS=("goodreads" "yelp" "amazon")
-SCENARIO="user_cold_start"
-# SCENARIO="classic"
+# SCENARIO="user_cold_start"
+SCENARIO="classic"
 
 # ── Global Configs (Dùng chung cho cả 3) ──────────────────────────────────
 STAGE="test"
@@ -28,7 +28,7 @@ MODEL="${MODEL:-qwen-small}"
 API_KEY="${API_KEY:-EMPTY}"
 BASE_URL="http://localhost:8036/v1"
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 
 # ── Vòng lặp chính qua 3 Dataset ──────────────────────────────────────────
 for DS in "${DATASETS[@]}"; do
@@ -38,8 +38,8 @@ for DS in "${DATASETS[@]}"; do
     echo "############################################################"
 
     # --- Tự động cập nhật Paths dựa trên Dataset hiện tại ---
-    DATA_DIR="./data_old/${DS}/"
-    MODEL_PATH="./saved_models/${DS}_best_model_old.pt"
+    DATA_DIR="./data/${DS}/"
+    MODEL_PATH="./saved_models/${DS}_best_model.pt"
     CANDIDATE_DIR="../../dataset/tasks5/${SCENARIO}/${DS}/tasks"
     FAISS_DB_PATH="./faiss_dbs/${DS}_rich"
     GCN_PATH="./saved_models/${DS}_gcn_emb_remapped.pt"
@@ -49,7 +49,7 @@ for DS in "${DATASETS[@]}"; do
 
     # --- Định nghĩa Output riêng cho từng Dataset ---
     P_MODEL="SASRec_MoE"
-    NAME="moe_seq_new"
+    NAME="moe_no_gcn_new"
     OUTPUT_FILE="./output/${DS}_${SCENARIO}_${NAME}/${P_MODEL}_${MODEL}_SEED${SEED}_ep${MAX_EPOCH}.jsonl"
     RESULT_FILE="./output/${DS}_${SCENARIO}_${NAME}/evaluation_results_${NAME}_${DS}.json"
     # Tạo thư mục output

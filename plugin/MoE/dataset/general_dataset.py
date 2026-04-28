@@ -98,6 +98,9 @@ class GeneralDataset(data.Dataset):
     def session_data4frame(self, datapath, id2name):
         df = pd.read_pickle(datapath)
         
+        if 'is_test_user' in df.columns and self.stage in ['test', 'val']:
+            df = df[df['is_test_user'] == True]
+            
         # Loại bỏ padding để lấy tên sản phẩm thật
         def remove_padding(xx):
             return [x for x in xx if x != self.padding_item_id]
