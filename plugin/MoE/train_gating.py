@@ -32,8 +32,16 @@ from dataset.general_dataset import GeneralDataset
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Feature labels khớp với v2.1
-FEATURE_LABELS = ['norm_seq_len', 'agree_gcn', 'agree_sem', 'gcn_confidence', 'sem_confidence']
+# Feature labels khớp với v2.2
+FEATURE_LABELS = [
+    'norm_seq_len',
+    'agree_gcn',
+    'agree_sem',
+    'agree_gcn_sem',   # v2.2 NEW: Spearman(gcn, sem)
+    'seq_confidence',  # v2.2 NEW: max-mean of seq scores
+    'gcn_confidence',
+    'sem_confidence',
+]
 
 
 def _minmax(d: Dict[str, float]) -> Dict[str, float]:
@@ -355,7 +363,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'[train_gating v2.1] Device={device} | dataset={args.dataset} | split={args.split}')
+    print(f'[train_gating v2.2] Device={device} | dataset={args.dataset} | split={args.split}')
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Load SASRec ──────────────────────────────────────────────────────────
@@ -412,9 +420,9 @@ def main():
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    # ── GatingConfig v2.1 ────────────────────────────────────────────────────
+    # ── GatingConfig v2.2 ────────────────────────────────────────────────────
     cfg = GatingConfig(
-        input_dim          = 5,            # ← v2.1: 5 features
+        input_dim          = 7,            # ← v2.2: 7 features
         hidden_dims        = [32, 16],
         dropout            = 0.2,
         epochs             = args.epochs,
@@ -425,7 +433,7 @@ def main():
     )
 
     # ── Build training data ──────────────────────────────────────────────────
-    print('\n📦 Building context training data (5-feature v2.1)...')
+    print('\n📦 Building context training data (7-feature v2.2)...')
     X_raw, Y_target = build_training_data_context(
         loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
         cfg=cfg, temperature=args.kl_temp, balance_eps=args.balance_eps,
@@ -436,7 +444,7 @@ def main():
     X_norm, mu, std = normalize_features(X_raw)
 
     # ── Train ────────────────────────────────────────────────────────────────
-    print('\n🚀 Training GatingMLP v2.1 (5-feature context-mode)...')
+    print('\n🚀 Training GatingMLP v2.2 (7-feature context-mode)...')
     trained_mlp = train_gating_context(X_norm, Y_target, cfg, device)
 
     # ── Save ─────────────────────────────────────────────────────────────────
@@ -447,7 +455,7 @@ def main():
         'norm_mean':        mu.tolist(),
         'norm_std':         std.tolist(),
         'gating_mode':      'context',
-        'feature_version':  'v2.1',
+        'feature_version':  'v2.2',
         'feature_names':    FEATURE_LABELS,
     }, out_path)
     print(f'\n✅ Saved → {out_path}')

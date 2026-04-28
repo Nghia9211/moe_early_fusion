@@ -43,6 +43,12 @@ class SemanticScorer:
         return texts
 
     def _embed_and_score(self, query: str, candidate_names: List[str]) -> Dict[str, float]:
+        """
+        Trả về raw cosine similarity scores (chưa normalize).
+        Việc normalize được thực hiện tập trung trong moe_fusion._minmax()
+        để đảm bảo tất cả experts (seq, gcn, sem) đi qua cùng 1 lần normalize,
+        tránh double normalization bất đối xứng.
+        """
         if not candidate_names or self.embedding_function is None:
             return {n: 0.0 for n in candidate_names}
 
@@ -51,12 +57,8 @@ class SemanticScorer:
             query_vec = np.array(self.embedding_function.embed_query(query), dtype=np.float32)
             cand_vecs = np.array(self.embedding_function.embed_documents(candidate_texts), dtype=np.float32)
             sims = _cosine_sim(query_vec, cand_vecs)
-            
-            # Min-Max Scaling Cục bộ
-            min_s, max_s = float(sims.min()), float(sims.max())
-            norm_sims = (sims - min_s) / (max_s - min_s) if max_s > min_s else np.full_like(sims, 0.5)
-            
-            return {name: float(np.clip(norm_sims[i], 0.0, 1.0)) for i, name in enumerate(candidate_names)}
+            # Raw cosine scores ∈ [-1, 1]; moe_fusion._minmax() sẽ normalize sau
+            return {name: float(sims[i]) for i, name in enumerate(candidate_names)}
         except Exception as e:
             return {n: 0.0 for n in candidate_names}
 

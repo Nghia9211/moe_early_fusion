@@ -28,18 +28,22 @@ class GatingConfig:
     """Config cho MLP gating network.
     
     gating_mode:
-      'context'  — input là user-context features (v2, mặc định mới)
+      'context'  — input là user-context features (v2.2, mặc định mới)
       'score'    — input là expert scores của item (v1 cũ, bị bias)
     
-    Context features (khi mode='context', input_dim=6):
+    Context features (khi mode='context', input_dim=7):
       0: norm_seq_len         — len_seq / max_seq_len
-      1: cold_start_flag      — 1 nếu len_seq <= cold_threshold
-      2: gcn_coverage         — tỉ lệ items trong history có GCN embedding
-      3: seq_score_entropy    — entropy phân phối điểm SASRec trên candidates
-      4: expert_agreement_gcn — Spearman rank correlation seq vs gcn
-      5: expert_agreement_sem — Spearman rank correlation seq vs sem
+      1: agree_gcn            — Spearman rank corr seq vs gcn, mapped [0,1]
+      2: agree_sem            — Spearman rank corr seq vs sem, mapped [0,1]
+      3: agree_gcn_sem        — Spearman rank corr gcn vs sem, mapped [0,1]  ← v2.2
+      4: seq_confidence       — max - mean của SASRec scores  ∈ [0,1]        ← v2.2
+      5: gcn_confidence       — max - mean của GCN scores     ∈ [0,1]
+      6: sem_confidence       — max - mean của Sem scores     ∈ [0,1]
+
+    NOTE: semantic_scorer trả về raw cosine scores (không minmax nội bộ).
+          moe_fusion._minmax() normalize tập trung cho cả 3 experts.
     """
-    input_dim:    int   = 6         # 6 context features
+    input_dim:    int   = 7         # 7 context features (v2.2)
     hidden_dims:  list  = field(default_factory=lambda: [32, 16])
     dropout:      float = 0.2
     lr:           float = 1e-3
@@ -88,8 +92,8 @@ class MoEConfig:
 
     gating_model_path: str = None
 
-    use_seq:      bool = False
-    use_gcn:      bool = False
+    use_seq:      bool = True
+    use_gcn:      bool = True
     use_semantic: bool = True
     use_reranker: bool = False
 

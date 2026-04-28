@@ -10,7 +10,7 @@ work_dir="."
 cd "$work_dir"
 
 # ── Dataset List & Scenario ───────────────────────────────────────────────
-DATASETS=( "goodreads")
+DATASETS=( "amazon")
 # DATASETS=("goodreads" "yelp" "amazon")
 # SCENARIO="user_cold_start"
 SCENARIO="classic"
@@ -49,7 +49,7 @@ for DS in "${DATASETS[@]}"; do
 
     # --- Định nghĩa Output riêng cho từng Dataset ---
     P_MODEL="SASRec_MoE"
-    NAME="moe_no_gcn_new"
+    NAME="moe_no_sem_new"
     OUTPUT_FILE="./output/${DS}_${SCENARIO}_${NAME}/${P_MODEL}_${MODEL}_SEED${SEED}_ep${MAX_EPOCH}.jsonl"
     RESULT_FILE="./output/${DS}_${SCENARIO}_${NAME}/evaluation_results_${NAME}_${DS}.json"
     # Tạo thư mục output
