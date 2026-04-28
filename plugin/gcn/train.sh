@@ -28,7 +28,7 @@ python3 "$BUILD_SCRIPT" \
     --user_file "$USER_FILE" \
     --item_file "$ITEM_FILE" \
     --review_file "$REVIEW_FILE" \
-    --gt_file "$GT_FILE" \
+    --gt_folder "$GT_FILE" \
     --output_file "$OUTPUT_DATA"
 
 # Kiểm tra lỗi (Trong Linux dùng $? thay cho ERRORLEVEL)
@@ -42,7 +42,7 @@ echo "[SUCCESS] Graph built successfully!"
 
 # --- 2. PHASE TRAINING ---
 
-EPOCHS=3000
+EPOCHS=500
 BATCH_SIZE=1024
 LR=0.001
 REG=1e-3

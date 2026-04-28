@@ -1,9 +1,8 @@
-
 #!/bin/bash
 
 # 1. Khai báo mảng chứa tên các dataset bạn muốn chạy
-DATASETS=("amazon" "yelp" "goodreads")
-# DATASETS=("amazon")
+# DATASETS=("amazon" "yelp" "goodreads")
+DATASETS=("amazon")
 
 # 2. Khai báo các tham số dùng chung để dễ chỉnh sửa sau này
 EMBED_MODEL="sentence-transformers/all-MiniLM-L6-v2"
@@ -18,7 +17,7 @@ for ds in "${DATASETS[@]}"; do
     echo "=========================================================="
 
     # Gọi script python tương ứng với tên dataset
-    python3 "build_faiss_${ds}.py" \
+    python3 "faiss_${ds}.py" \
         --data_path "../gcn/graph_data/item_${ds}.json" \
         --save_path "../MoE/faiss_dbs/${ds}_rich" \
         --embed_model "$EMBED_MODEL" \
