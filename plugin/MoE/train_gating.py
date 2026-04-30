@@ -353,10 +353,10 @@ def main():
     parser.add_argument('--epochs',      type=int,   default=50)
     parser.add_argument('--lr',          type=float, default=1e-3)
     parser.add_argument('--batch_size',  type=int,   default=256)
-    parser.add_argument('--kl_temp',     type=float, default=2.0)
-    parser.add_argument('--balance_eps', type=float, default=0.05,
+    parser.add_argument('--kl_temp',     type=float, default=0.0)
+    parser.add_argument('--balance_eps', type=float, default=0.0,
                         help='Nếu max-min quality < eps → equal target gates')
-    parser.add_argument('--entropy_reg', type=float, default=0.15)
+    parser.add_argument('--entropy_reg', type=float, default=0.00)
     parser.add_argument('--split',       default='val', choices=['train', 'val', 'test'])
     parser.add_argument('--hidden_size', type=int,   default=64)
     parser.add_argument('--embed_model', default='sentence-transformers/all-MiniLM-L6-v2')
