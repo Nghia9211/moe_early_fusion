@@ -44,7 +44,7 @@ def main():
 
     # 2. Khởi tạo HuggingFace Embedding Model
     print("Loading Sentence-Transformer Model...")
-    embed_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embed_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
 
     # 3. Trích xuất Vector
     print(f"Embedding {len(sampled_names)} items...")

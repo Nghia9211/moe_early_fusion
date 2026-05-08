@@ -145,8 +145,8 @@ def split_rec_reponse(response):
         print("[split_rec_reponse] response is None")
         return None, None
     response = str(response) + '\n'
-    pattern = r'Reason: (.*?)\nItem: (.*?)\n'
-    matches = re.findall(pattern, response, re.DOTALL)
+    pattern = r'Reason:\s*(.*?)\nItem:\s*(.*?)\n'
+    matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
     if len(matches) != 1:
         print("[split_rec_reponse] cannot split, response =", response)
         return None, None
@@ -159,8 +159,8 @@ def split_user_response(response):
         print("[split_user_response] response is None")
         return None, None
     response = str(response) + '\n'
-    pattern = r'Reason: (.*?)\nDecision: (.*?)\n'
-    matches = re.findall(pattern, response, re.DOTALL)
+    pattern = r'Reason:\s*(.*?)\nDecision:\s*(.*?)\n'
+    matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
     if len(matches) != 1:
         print("[split_user_response] cannot split, response =", response)
         return None, None

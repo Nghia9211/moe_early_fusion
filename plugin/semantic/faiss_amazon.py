@@ -151,10 +151,22 @@ def build_and_save(data_path: str, save_path: str, embed_model: str, batch_size:
             if not documents_batch: continue
             total_docs += len(documents_batch)
 
+            # FIX v3.0: dùng merge_from() thay vì add_documents()
+            # add_documents() không normalize vectors → inconsistent với COSINE index
+            # merge_from() merge 2 FAISS objects cùng strategy → đảm bảo nhất quán
             if vector_store is None:
-                vector_store = FAISS.from_documents(documents=documents_batch, embedding=embedding_function, distance_strategy="COSINE")
+                vector_store = FAISS.from_documents(
+                    documents=documents_batch,
+                    embedding=embedding_function,
+                    distance_strategy="COSINE"
+                )
             else:
-                vector_store.add_documents(documents=documents_batch)
+                batch_vs = FAISS.from_documents(
+                    documents=documents_batch,
+                    embedding=embedding_function,
+                    distance_strategy="COSINE"
+                )
+                vector_store.merge_from(batch_vs)
 
             print(f"[Build] Batch {batch_count} | docs={total_docs} | elapsed={time.time() - start_time:.0f}s")
 

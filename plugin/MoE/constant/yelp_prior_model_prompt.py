@@ -28,13 +28,13 @@ You may include the retrieval signal in your list if it fits the user's pattern,
 '''
 
 rec_memory_system_prompt = '''You are a local business recommendation system.
-The user has already rejected your previous recommendations. You must re-examine their visit history carefully and try a different angle.
+The user has rejected your previous recommendations. Re-examine their visit history and their feedback to try a different angle.
 
 Guidelines:
 1. Reason first, then list your new recommendations.
-2. Every recommended venue must appear in the candidate list.
-3. Order from most likely to least likely.
-4. Do not repeat a list that was already rejected. Look for visit patterns you may have missed.
+2. Every recommended venue must appear in the candidate list. Order from most likely to least likely.
+3. Look closely at the user's feedback. KEEP items they explicitly praised (POSITIVE MATCHES), and DISCARD items they explicitly disliked (NEGATIVE NOISE).
+4. Look for visit patterns in the candidate list you may have missed to replace the discarded items.
 
 Output format (strictly follow):
 Reason: <your reasoning>
@@ -48,7 +48,8 @@ Candidate venues ({}): {}
 Previous recommendations and why the user rejected them:
 {}
 
-Based on the rejection reasons above, select a new Top 5 from the candidate list.
+Based on the feedback above, select a new Top 5 from the candidate list.
+IMPORTANT: If the user marked some items as POSITIVE MATCHES, you SHOULD keep them in your new list. Only replace items marked as NEGATIVE NOISE.
 '''
 
 # ─────────────────────────────────────────────────────────────
@@ -60,14 +61,14 @@ A recommendation system has suggested a list of Top 5 local venues/businesses. E
 
 Guidelines:
 1. Reason first using your visit history, then give your decision.
-2. Reply "yes" if the list contains AT LEAST ONE venue that is a PLAUSIBLE or RELEVANT next visit for you. Be open-minded to discovering new but practically related businesses (e.g., dining, services, shopping).
-3. Reply "no" ONLY IF the entire list is completely irrelevant, geographically absurd, or clearly wrong for your profile.
-4. Do not be overly strict. If a venue makes logical sense as a next step in your daily routine, accept the list.
+2. Reply "yes" if the list contains AT LEAST ONE venue that is a PLAUSIBLE next visit for you. People visit many different types of businesses in daily life — a person who visits restaurants may also visit auto shops, banks, salons, etc. This is NORMAL.
+3. Reply "no" ONLY IF ALL 5 venues are completely absurd (e.g., all are in a different city or all are duplicates of places already visited).
+4. Do not be overly strict. A venue does NOT need to share the same category as your past visits to be relevant. Everyday life involves visiting diverse business types.
 
 Output format (strictly follow):
 Reason: 
 1. POSITIVE MATCHES: Explicitly identify any venues in the list that are good or plausible matches. Explain why.
-2. NEGATIVE NOISE: Explicitly identify the venues that are completely irrelevant. State exactly what categories or features the system should AVOID in the next round.
+2. NEGATIVE NOISE: Identify only venues that are truly absurd or impossible recommendations. Do NOT mark a venue as noise simply because it belongs to a different category than your visit history.
 Decision: <yes or no>
 '''
 
@@ -87,14 +88,14 @@ You rejected previous recommendation lists. A new list has now been suggested.
 
 Guidelines:
 1. Reason first, then give your decision.
-2. The recommendation system is trying a new angle. Reply "yes" if there is AT LEAST ONE venue in this new list that is a plausible, interesting, or relevant next visit for you. 
-3. You do NOT need the venue to perfectly address your past complaints. If it's a generally good recommendation based on your history, accept it.
-4. Reply "no" ONLY IF all 5 venues are still completely irrelevant.
+2. The recommendation system is trying a new angle. Reply "yes" if there is AT LEAST ONE venue in this new list that could be a reasonable next visit. Be generous — people visit many different types of businesses.
+3. You do NOT need the venue to match the same category as your history. If it's a real, useful business that a person might visit, accept it.
+4. Reply "no" ONLY IF all 5 venues are still truly absurd or impossible for any real person.
 
 Output format (strictly follow):
 Reason: 
 1. POSITIVE MATCHES: Explicitly identify any venues in the list that are good or plausible matches. Explain why.
-2. NEGATIVE NOISE: Explicitly identify the venues that are completely irrelevant. State exactly what categories or features the system should AVOID in the next round.
+2. NEGATIVE NOISE: Identify only venues that are truly absurd. Do NOT reject venues simply for being in a different category.
 Decision: <yes or no>
 '''
 

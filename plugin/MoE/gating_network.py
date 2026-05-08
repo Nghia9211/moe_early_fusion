@@ -81,6 +81,8 @@ def _spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
     """Spearman rank correlation giữa 2 score vectors."""
     if len(a) < 3:
         return 0.0
+    if np.all(a == a[0]) or np.all(b == b[0]):
+        return 0.0
     from scipy.stats import spearmanr
     corr, _ = spearmanr(a, b)
     return float(corr) if not np.isnan(corr) else 0.0

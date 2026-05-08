@@ -39,7 +39,7 @@ class MoERecAgent:
         self.item_name_map = item_name_map or {}
         self.llm           = llm
         self.dataset = next((d for d in ['yelp', 'amazon', 'goodreads'] if d in getattr(args, 'data_dir', '')), 'amazon')
-        self.cfg = get_config_for_dataset()
+        self.cfg = get_config_for_dataset(dataset=self.dataset)
 
         with MoERecAgent._init_lock:
             self._init_shared_resources(args)
@@ -65,7 +65,7 @@ class MoERecAgent:
 
         if cls._shared_embedding is None:
             from langchain_huggingface import HuggingFaceEmbeddings
-            embed_model = getattr(args, 'embed_model_name', "sentence-transformers/all-MiniLM-L6-v2")
+            embed_model = getattr(args, 'embed_model_name', "sentence-transformers/all-mpnet-base-v2")
             cls._shared_embedding = HuggingFaceEmbeddings(model_name=embed_model)
 
         if cls._shared_vector_store is None:
@@ -108,6 +108,7 @@ class MoERecAgent:
             'vector_store': self.vector_store, 'embedding_function': self.embedding_fn,
             'id2name': self.id2name, 'name2id': self.name2id, 'id2rawid': self.id2rawid,
             'item_num': self.item_num, 'device': self.device,
+            'dataset': self.dataset,   # NEW v3.0: for dataset-specific query format
         }
         self.seq_scorer = SeqScorer.from_shared(shared)
         self.gcn_scorer = GCNScorer.from_shared(shared) if self.gcn_embeddings is not None else None
@@ -123,7 +124,8 @@ class MoERecAgent:
         # Truyền gcn_norm vào MoEFusion để tính gcn_coverage feature trong context-gating
         gcn_norm_ref = self.gcn_scorer.gcn_norm if self.gcn_scorer is not None else None
         self.fuser = MoEFusion(gating=self.gating, cfg=self.cfg, gcn_norm=gcn_norm_ref)
-        self.reranker = Reranker.from_shared(shared=shared, llm=self.llm, mode=getattr(self.args, 'reranker_mode', 'embed_only'), enabled=self.cfg.use_reranker, top_llm=getattr(self.args, 'reranker_top_llm', 15))
+        _output_dir = os.path.dirname(getattr(self.args, 'output_file', '') or '') or os.path.join(os.path.dirname(__file__), 'output')
+        self.reranker = Reranker.from_shared(shared=shared, llm=self.llm, mode=getattr(self.args, 'reranker_mode', 'embed_only'), enabled=self.cfg.use_reranker, top_llm=getattr(self.args, 'reranker_top_llm', 15), output_dir=_output_dir)
         self.combiner = ScoreCombiner(cfg=self.cfg.scoring)
 
     def _get_filtered_reviews(self, data: dict) -> list:
@@ -131,8 +133,18 @@ class MoERecAgent:
         if not tool: return []
         try:
             all_reviews = tool.get_reviews(user_id=str(data.get('id', '')))
-            candidate_ids = set(str(c) for c in data.get('cans', []))
-            return [r for r in all_reviews if str(r.get('item_id')) not in candidate_ids]
+            # ── RecHacker-style filter ─────────────────────────────────────────
+            # BUG FIX: data['cans'] là inner SASRec IDs (int),
+            # nhưng r['item_id'] là raw original IDs (str, e.g. 'B0092IJXS4').
+            # Phải map inner_id → raw_id qua id2rawid trước khi filter.
+            id2rawid = data.get('id2rawid', {})
+            candidate_raw_ids = set()
+            for inner_id in data.get('cans', []):
+                raw_id = id2rawid.get(inner_id)
+                if raw_id:
+                    candidate_raw_ids.add(str(raw_id))
+            return [r for r in all_reviews
+                    if str(r.get('item_id', '')) not in candidate_raw_ids]
         except Exception: return []
 
     def act(self, data: dict, reason: str = None, item: str = None, epoch: int = None, rejected_items: List[str] = None) -> Tuple[str, List[str], dict]:

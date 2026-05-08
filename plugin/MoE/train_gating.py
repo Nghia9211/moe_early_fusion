@@ -67,12 +67,29 @@ def _softmax(arr: np.ndarray, temp: float) -> np.ndarray:
 
 def _balanced_target(q_arr: np.ndarray, temp: float, balance_eps: float = 0.05) -> np.ndarray:
     """
-    Nếu expert quality tương đương nhau (max - min < balance_eps),
+    LEGACY: Nếu expert quality tương đương nhau (max - min < balance_eps),
     trả về [1/3, 1/3, 1/3] thay vì winner-takes-all.
     """
     if q_arr.max() - q_arr.min() < balance_eps:
         return np.array([1/3, 1/3, 1/3], dtype=np.float32)
     return _softmax(q_arr, temp).astype(np.float32)
+
+
+def _quality_target_v3(q_arr: np.ndarray, min_quality: float = 0.1) -> Optional[np.ndarray]:
+    """
+    Quality-proportional target with weak expert suppression.
+    
+    If an expert's NDCG quality < min_quality, its target weight → 0.
+    If NO expert passes the threshold, return None (skip sample).
+    """
+    q_masked = q_arr.copy()
+    q_masked[q_masked < min_quality] = 0.0
+    
+    total = q_masked.sum()
+    if total < 1e-8:
+        return None  # No expert is good → skip
+    
+    return (q_masked / total).astype(np.float32)
 
 
 def build_context_feature(
@@ -215,13 +232,16 @@ def build_training_data_context(
                 seq_list, len_seq_i, s_seq, s_gcn, s_sem, gcn_norm, cfg
             )
 
-            # ── KL target: NDCG quality per expert ──────────────────────────
+            # ── Target: NDCG quality per expert ──────────────────────────
             q_seq = _ndcg_quality(gt_name, s_seq)
             q_gcn = _ndcg_quality(gt_name, s_gcn) if s_gcn else 0.0
             q_sem = _ndcg_quality(gt_name, s_sem) if s_sem else 0.0
             q_arr = np.array([q_seq, q_gcn, q_sem], dtype=np.float32)
 
-            target_gate = _balanced_target(q_arr, temperature, balance_eps)
+            # v3: quality-aware target with weak expert suppression
+            target_gate = _quality_target_v3(q_arr, min_quality=balance_eps)
+            if target_gate is None:
+                continue  # Skip samples where no expert is good
 
             X_list.append(ctx)
             Y_list.append(target_gate)
@@ -278,8 +298,8 @@ def train_gating_context(
     X_vl = torch.tensor(X[v_idx],        dtype=torch.float32).to(device)
     Y_vl = torch.tensor(Y_target[v_idx], dtype=torch.float32).to(device)
 
-    kl_fn = nn.KLDivLoss(reduction='batchmean')
-    ent_w = getattr(cfg, 'entropy_reg_weight', 0.15)
+    # v3: concentration regularization (positive = penalize uniform gates)
+    conc_w = getattr(cfg, 'concentration_weight', 0.02)
 
     best_val, best_state = float('inf'), None
 
@@ -291,9 +311,11 @@ def train_gating_context(
             optimizer.zero_grad()
             gates = model(x_b)                              # (B, 3) — softmax
 
-            kl   = kl_fn(gates.log().clamp(min=-100), y_b)
-            H    = -(gates * gates.log().clamp(min=-100)).sum(dim=-1).mean()
-            loss = kl - ent_w * H
+            # Cross-entropy loss: -Σ target_i * log(pred_i)
+            ce = -(y_b * gates.log().clamp(min=-100)).sum(dim=-1).mean()
+            # Concentration reg: penalize uniform gates (opposite of entropy bonus)
+            neg_H = (gates * gates.log().clamp(min=-100)).sum(dim=-1).mean()
+            loss = ce + conc_w * neg_H
 
             loss.backward()
             optimizer.step()
@@ -303,9 +325,9 @@ def train_gating_context(
         model.eval()
         with torch.no_grad():
             vl_gates = model(X_vl)
-            vl_kl    = kl_fn(vl_gates.log().clamp(min=-100), Y_vl).item()
-            vl_H     = -(vl_gates * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
-            val_loss = vl_kl - ent_w * vl_H
+            vl_ce    = -(Y_vl * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
+            vl_negH  = (vl_gates * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
+            val_loss = vl_ce + conc_w * vl_negH
 
         if val_loss < best_val:
             best_val   = val_loss
@@ -353,10 +375,13 @@ def main():
     parser.add_argument('--epochs',      type=int,   default=50)
     parser.add_argument('--lr',          type=float, default=1e-3)
     parser.add_argument('--batch_size',  type=int,   default=256)
-    parser.add_argument('--kl_temp',     type=float, default=0.0)
-    parser.add_argument('--balance_eps', type=float, default=0.0,
-                        help='Nếu max-min quality < eps → equal target gates')
-    parser.add_argument('--entropy_reg', type=float, default=0.00)
+    parser.add_argument('--kl_temp',     type=float, default=1.0)
+    parser.add_argument('--balance_eps', type=float, default=0.1,
+                        help='v3: expert quality threshold. Experts with NDCG < this → gate=0')
+    parser.add_argument('--entropy_reg', type=float, default=0.0,
+                        help='DEPRECATED. Use --conc_weight instead.')
+    parser.add_argument('--conc_weight', type=float, default=0.02,
+                        help='Concentration reg weight. Positive = penalize uniform gates')
     parser.add_argument('--split',       default='val', choices=['train', 'val', 'test'])
     parser.add_argument('--hidden_size', type=int,   default=64)
     parser.add_argument('--embed_model', default='sentence-transformers/all-MiniLM-L6-v2')
@@ -422,7 +447,7 @@ def main():
 
     # ── GatingConfig v2.2 ────────────────────────────────────────────────────
     cfg = GatingConfig(
-        input_dim          = 7,            # ← v2.2: 7 features
+        input_dim          = 7,
         hidden_dims        = [32, 16],
         dropout            = 0.2,
         epochs             = args.epochs,
@@ -430,6 +455,8 @@ def main():
         batch_size         = args.batch_size,
         gating_mode        = 'context',
         entropy_reg_weight = args.entropy_reg,
+        expert_quality_threshold = args.balance_eps,
+        concentration_weight     = args.conc_weight,
     )
 
     # ── Build training data ──────────────────────────────────────────────────

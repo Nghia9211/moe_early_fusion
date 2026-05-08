@@ -13,7 +13,7 @@ REVIEW_FILE="${BASE_PATH}/review_${DATASET}.json"
 GT_FILE="${BASE_PATH}/ground_truth_gcn_${DATASET}.json"
 
 OUTPUT_DATA="gcn_graph/processed_graph_data_${DATASET}.pt"
-OUTPUT_EMB="gcn_embedding/gcn_embeddings_3hop_${DATASET}.pt"
+OUTPUT_EMB="gcn_embedding/${DATASET}_gcn_emb.pt"
 
 echo ""
 echo "========================================================"

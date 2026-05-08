@@ -58,9 +58,21 @@ class GatingConfig:
     # Gating mode
     gating_mode:   str   = 'context'   # 'context' | 'score'
     
-    # Entropy regularization — buộc gates phân tán
-    entropy_reg_weight: float = 0.15
+    # Entropy regularization — buộc gates phân tán (DEPRECATED, dùng concentration_weight thay thế)
+    entropy_reg_weight: float = 0.05
     
+    # NEW v3: Quality-aware loss parameters
+    # If expert NDCG quality < this threshold → target weight = 0 (suppress weak experts)
+    expert_quality_threshold: float = 0.1
+    # Concentration regularization: positive = encourage specialization (winner-take-more)
+    # This is the OPPOSITE of entropy bonus. Set > 0 to penalize uniform gates.
+    concentration_weight: float = 0.02
+    
+    # Runtime expert agreement correction (v3.0)
+    # At inference, if an expert's ranking has Spearman correlation < this
+    # with the consensus of the other two experts, its gate is suppressed.
+    # Set to 0.0 to disable. Recommended: 0.1-0.2
+    min_agreement_corr: float = 0.15
     # Context feature thresholds
     max_seq_len:       int   = 50
     cold_threshold:    int   = 5
@@ -95,18 +107,17 @@ class MoEConfig:
     use_seq:      bool = True
     use_gcn:      bool = True
     use_semantic: bool = True
-    use_reranker: bool = False
-
+    use_reranker: bool = True
 
 DEFAULT_CONFIG = MoEConfig()
 
 
-def get_config_for_dataset() -> MoEConfig:
+def get_config_for_dataset(dataset: str = None) -> MoEConfig:
     """
     Trả về MoEConfig được tinh chỉnh cho từng dataset.
 
     Amazon:    GCN tốt → balanced
-    Yelp:      SASRec tốt → seq heavy
+    Yelp:      SASRec tốt → seq heavy, Semantic yếu → suppress
     Goodreads: cả GCN và SASRec fail vì sparse →
                FAISS dẫn dắt hoàn toàn
     """
@@ -118,5 +129,22 @@ def get_config_for_dataset() -> MoEConfig:
     cfg.retrieval.top_M   = 20
     cfg.retrieval.top_K   = 5
     cfg.gating.default_weights = [1/3, 1/3, 1/3]
+
+    if dataset == 'yelp':
+        # Yelp: Seq (0.70) >> GCN (0.64) >> Sem (0.40)
+        # Sem is a noise injector → high threshold to suppress
+        cfg.gating.expert_quality_threshold = 0.15
+        cfg.gating.concentration_weight = 0.05
+        cfg.gating.default_weights = [0.50, 0.45, 0.05]
+    elif dataset == 'goodreads':
+        # Goodreads: Sem is valuable
+        cfg.gating.expert_quality_threshold = 0.05
+        cfg.gating.concentration_weight = 0.0
+        cfg.gating.default_weights = [0.2, 0.2, 0.6]
+    elif dataset == 'amazon':
+        # Amazon: Balanced experts
+        cfg.gating.expert_quality_threshold = 0.05
+        cfg.gating.concentration_weight = 0.01
+        cfg.gating.default_weights = [1/3, 1/3, 1/3]
 
     return cfg

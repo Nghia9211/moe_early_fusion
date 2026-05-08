@@ -10,27 +10,26 @@ work_dir="."
 cd "$work_dir"
 
 # ── Dataset List & Scenario ───────────────────────────────────────────────
-# DATASETS=( "goodreads")
-# DATASETS=("goodreads" "amazon")
-DATASETS=("goodreads" "yelp" "amazon")
+# DATASETS=( "goodreads" "amazon")
+DATASETS=("amazon")
+# DATASETS=("goodreads" "yelp")
 
 # Đổi SCENARIO thành mảng để loop
 SCENARIOS=("user_cold_start" "classic")
+# SCENARIOS=("classic")
 
 # ── Global Configs (Dùng chung cho cả 3) ──────────────────────────────────
 STAGE="test"
 CANS_NUM=20
-MAX_EPOCH=1
+MAX_EPOCH=5
 MAX_SAMPLES=-1    # -1 = toàn bộ dataset
-MP=10
+MP=8
 SEED=303
 TEMPERATURE="0.0"
 RERANKER_MODE="llm"     # llm | embed_only | hybrid
-MODEL="${MODEL:-qwen-small}"
+MODEL="${MODEL:-qwen-research}"
 API_KEY="${API_KEY:-EMPTY}"
-BASE_URL="http://localhost:8036/v1"
-
-export CUDA_VISIBLE_DEVICES=2
+BASE_URL="http://localhost:11435/v1"
 
 # ── Vòng lặp chính qua Dataset và Scenario ────────────────────────────────
 for DS in "${DATASETS[@]}"; do
@@ -42,7 +41,7 @@ for DS in "${DATASETS[@]}"; do
 
         # --- Tự động cập nhật Paths dựa trên Dataset hiện tại ---
         DATA_DIR="./data/${DS}/"
-        MODEL_PATH="./saved_models/${DS}_best_mode.pt"
+        MODEL_PATH="./saved_models/${DS}_best_model.pt"
         CANDIDATE_DIR="../../dataset/tasks5/${SCENARIO}/${DS}/tasks"
         FAISS_DB_PATH="./faiss_dbs/${DS}_rich"
         GCN_PATH="./saved_models/${DS}_gcn_emb_remapped.pt"
@@ -52,7 +51,7 @@ for DS in "${DATASETS[@]}"; do
 
         # --- Định nghĩa Output riêng cho từng Dataset ---
         P_MODEL="SASRec_MoE"
-        NAME="moe_7_feature_default_weight"
+        NAME="moe_celoss_all_component_fix_data_leakage"
         OUTPUT_FILE="./output/${DS}_${SCENARIO}_${NAME}/${P_MODEL}_${MODEL}_SEED${SEED}_ep${MAX_EPOCH}.jsonl"
         RESULT_FILE="./output/${DS}_${SCENARIO}_${NAME}/evaluation_results_${NAME}_${DS}.json"
         # Tạo thư mục output
@@ -73,7 +72,7 @@ for DS in "${DATASETS[@]}"; do
             --item_mapping_file="$ITEMFILE" \
             --faiss_db_path="$FAISS_DB_PATH" \
             --gcn_path="$GCN_PATH" \
-            --embed_model_name="sentence-transformers/all-MiniLM-L6-v2" \
+            --embed_model_name="sentence-transformers/all-mpnet-base-v2" \
             --gating_model_path="$GATING_MODEL_PATH" \
             --reranker_mode="$RERANKER_MODE" \
             --reranker_top_llm=15 \

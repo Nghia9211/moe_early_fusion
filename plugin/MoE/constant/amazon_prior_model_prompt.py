@@ -28,13 +28,13 @@ You may include the retrieval signal in your list if it fits the user's pattern,
 '''
 
 rec_memory_system_prompt = '''You are a product recommendation system.
-The user has already rejected your previous recommendations. You must re-examine their purchase history carefully and try a different angle.
+The user has rejected your previous recommendations. Re-examine their purchase history and their feedback to try a different angle.
 
 Guidelines:
 1. Reason first, then list your new recommendations.
-2. Every recommended product must appear in the candidate list.
-3. Order from most likely to least likely.
-4. Do not repeat a list that was already rejected. Look for patterns you may have missed.
+2. Every recommended product must appear in the candidate list. Order from most likely to least likely.
+3. Look closely at the user's feedback. KEEP items they explicitly praised (POSITIVE MATCHES), and DISCARD items they explicitly disliked (NEGATIVE NOISE).
+4. Look for patterns in the candidate list you may have missed to replace the discarded items.
 
 Output format (strictly follow):
 Reason: <your reasoning>
@@ -48,7 +48,8 @@ Candidate products ({}): {}
 Previous recommendations and why the user rejected them:
 {}
 
-Based on the rejection reasons above, select a new Top 5 from the candidate list.
+Based on the feedback above, select a new Top 5 from the candidate list.
+IMPORTANT: If the user marked some items as POSITIVE MATCHES, you SHOULD keep them in your new list. Only replace items marked as NEGATIVE NOISE.
 '''
 
 # ─────────────────────────────────────────────────────────────
@@ -61,13 +62,13 @@ A recommendation system has suggested a list of Top 5 products. Evaluate this li
 Guidelines:
 1. Reason first using your purchase history, then give your decision.
 2. Reply "yes" if the list contains AT LEAST ONE product that is a PLAUSIBLE or RELEVANT next purchase for you. Be open-minded to discovering new but related items.
-3. Reply "no" ONLY IF the entire list is completely irrelevant, random, or clearly wrong for your profile.
-4. Do not be overly strict. If an item makes logical sense as a next step in your shopping journey, accept the list.
+3. Reply "no" ONLY IF ALL 5 products are completely absurd (e.g., all are in a category you have zero interest in).
+4. Do not be overly strict. Products from different gaming platforms (e.g., Xbox vs PlayStation vs Nintendo) but in the same GENRE or FRANCHISE are still relevant to a gamer. Accessories, controllers, cables, and peripherals related to gaming are also relevant regardless of platform. If an item makes logical sense as a next step in your shopping journey, accept the list.
 
 Output format (strictly follow):
 Reason: 
-1. POSITIVE MATCHES: Explicitly identify any products in the list that are good or plausible matches. Explain why.
-2. NEGATIVE NOISE: Explicitly identify the products that are completely irrelevant. State exactly what categories or features the system should AVOID in the next round.
+1. POSITIVE MATCHES: Explicitly identify any products in the list that are good or plausible matches. Explain why. Products in the same genre or franchise across platforms count as positive.
+2. NEGATIVE NOISE: Identify only products that are truly absurd or impossible recommendations. Do NOT mark a product as noise simply because it is for a different gaming platform than your history.
 Decision: <yes or no>
 '''
 
@@ -87,14 +88,14 @@ You rejected previous recommendation lists. A new list has now been suggested.
 
 Guidelines:
 1. Reason first, then give your decision.
-2. The recommendation system is trying a new angle. Reply "yes" if there is AT LEAST ONE product in this new list that is a plausible, interesting, or relevant next purchase for you. 
-3. You do NOT need the item to perfectly address your past complaints. If it's a generally good recommendation based on your history, accept it.
-4. Reply "no" ONLY IF all 5 items are still completely irrelevant.
+2. The recommendation system is trying a new angle. Reply "yes" if there is AT LEAST ONE product in this new list that could be a reasonable next purchase. Be generous — gamers often play across multiple platforms and genres.
+3. You do NOT need the product to match your exact platform. Games and accessories in the same genre or franchise across different platforms (Xbox, PlayStation, Nintendo, PC) are STILL relevant. Accept if it's a generally good recommendation.
+4. Reply "no" ONLY IF all 5 products are still truly absurd or have zero connection to your interests.
 
 Output format (strictly follow):
 Reason: 
-1. POSITIVE MATCHES: Explicitly identify any products in the list that are good or plausible matches. Explain why.
-2. NEGATIVE NOISE: Explicitly identify the products that are completely irrelevant. State exactly what categories or features the system should AVOID in the next round.
+1. POSITIVE MATCHES: Explicitly identify any products in the list that are good or plausible matches. Explain why. Cross-platform matches in the same genre count as positive.
+2. NEGATIVE NOISE: Identify only products that are truly absurd. Do NOT reject products simply for being on a different gaming platform.
 Decision: <yes or no>
 '''
 

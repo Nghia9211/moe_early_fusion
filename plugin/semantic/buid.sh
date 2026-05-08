@@ -5,7 +5,9 @@
 DATASETS=("amazon")
 
 # 2. Khai báo các tham số dùng chung để dễ chỉnh sửa sau này
-EMBED_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+# Upgrade v3.0: all-mpnet-base-v2 (768 dims) thay all-MiniLM-L6-v2 (384 dims)
+# Tốt hơn đáng kể về semantic quality, đặc biệt domain-specific retrieval
+EMBED_MODEL="sentence-transformers/all-mpnet-base-v2"
 BATCH_SIZE=256
 
 echo "Bắt đầu tiến trình build FAISS cho ${#DATASETS[@]} datasets..."

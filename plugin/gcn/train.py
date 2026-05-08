@@ -65,7 +65,7 @@ def main():
     criterion = BPRLoss(reg_weight=args.reg)
 
     num_batches = max(1, len(train_dict) // args.batch_size)
-    print("\n--- Start Training (LightGCN 3-Hop) ---")
+    print("\n--- Start Training (GCN 3-Hop) ---")
     print(f"Batches per epoch: {num_batches}")
     model.train()
     start_time = time.time()
