@@ -94,9 +94,9 @@ class FeedbackScoreAdjuster:
 
     def __init__(
         self,
-        negative_penalty:   float = 1.0, # Old 0.85
+        negative_penalty:   float = 0.8, # Old 0.85
         positive_boost:     float = 1.20,
-        soft_penalty:       float = 1.0, # old 0.9
+        soft_penalty:       float = 0.9, # old 0.9
         max_penalty_rounds: int   = 3,
         safe_rank_cutoff:   int   = 2,      # Rank 1-2 không bị penalize
         llm_client          = None,          # LLM client (có method invoke)

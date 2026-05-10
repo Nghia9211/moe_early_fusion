@@ -22,8 +22,6 @@ def _extract_signal(signal_scores: Dict[str, Dict[str, float]], key: str) -> Dic
     return {name: s.get(key, 0.0) for name, s in signal_scores.items()}
 
 
-
-
 class MoEFusion:
     def __init__(self, gating: GatingNetwork, cfg: MoEConfig = None,
                  gcn_norm=None):
