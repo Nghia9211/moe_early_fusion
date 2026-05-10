@@ -65,16 +65,6 @@ def _softmax(arr: np.ndarray, temp: float) -> np.ndarray:
     return e / e.sum()
 
 
-def _balanced_target(q_arr: np.ndarray, temp: float, balance_eps: float = 0.05) -> np.ndarray:
-    """
-    LEGACY: Nếu expert quality tương đương nhau (max - min < balance_eps),
-    trả về [1/3, 1/3, 1/3] thay vì winner-takes-all.
-    """
-    if q_arr.max() - q_arr.min() < balance_eps:
-        return np.array([1/3, 1/3, 1/3], dtype=np.float32)
-    return _softmax(q_arr, temp).astype(np.float32)
-
-
 def _quality_target_v3(q_arr: np.ndarray, min_quality: float = 0.1) -> Optional[np.ndarray]:
     """
     Quality-proportional target with weak expert suppression.

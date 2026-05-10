@@ -79,7 +79,7 @@ def _embed_similarity(query: str, candidate_names: List[str], candidate_texts: D
 
 def _llm_rerank(
     llm, data: dict, name2id: Dict[str, int], candidate_names: List[str], 
-    user_query: str, memory: List[str], max_candidates: int = 20,
+    user_query: str, memory: List[str], max_candidates: int = 10,
     output_dir: str = None
 ) -> Tuple[List[str], str]:
     cans_to_rank = candidate_names[:max_candidates]
@@ -110,20 +110,38 @@ def _llm_rerank(
     else:
         item_list_info = [{'Target_Name': n} for n in cans_to_rank]
 
-    items_desc_str = str(item_list_info)
+    # ── FORMAT ITEMS AS NUMBERED ML RANKING ──────────────────────────────
+    numbered_lines = []
+    for idx, info in enumerate(item_list_info, 1):
+        name = info.get('Target_Name', 'Unknown')
+        details = []
+        for k in ['average_rating', 'stars', 'rating_number', 'ratings_count',
+                   'review_count', 'description', 'attributes']:
+            v = info.get(k)
+            if v:
+                if k == 'description' and isinstance(v, str) and len(v) > 150:
+                    v = v[:150] + '...'
+                if k == 'attributes' and isinstance(v, str) and len(v) > 100:
+                    v = v[:100] + '...'
+                details.append(f"{k}: {v}")
+        detail_str = ", ".join(details) if details else "No additional info"
+        numbered_lines.append(f'  #{idx}: "{name}" — {detail_str}')
+    ranked_display = "\n".join(numbered_lines)
+
     try:
         import tiktoken
         enc = tiktoken.get_encoding("cl100k_base")
-        encoded_items = enc.encode(items_desc_str)
-        if len(encoded_items) > 6000: items_desc_str = enc.decode(encoded_items[:6000])
+        encoded_items = enc.encode(ranked_display)
+        if len(encoded_items) > 6000: ranked_display = enc.decode(encoded_items[:6000])
     except Exception:
-        items_desc_str = items_desc_str[:25000]
+        ranked_display = ranked_display[:25000]
 
-    # ── LLM PROMPT 4.1: SOFT CORRECTION + KEEP GUARD ──
+    # ── LLM PROMPT 5.0: MOE-ANCHORED REFINEMENT ──────────────────────────
     if len(memory) > 0:
         dialogue_hist = "\n".join(memory[-2:])
-        prompt = f"""You are a recommendation system for {task_item}s on {task_type}.
-In the previous round, you recommended items but the user rejected them. 
+        prompt = f"""You are a recommendation refinement system for {task_item}s on {task_type}.
+A specialized ML model ranked candidates for this user. The user rejected the previous recommendation.
+Your job is to REFINE the ranking based on the user's feedback.
 
 User's Profile & History:
 {user_query}
@@ -131,33 +149,34 @@ User's Profile & History:
 Previous Dialogue & User's Critique:
 {dialogue_hist}
 
-You must evaluate the ENTIRE candidate list again: {str(cans_to_rank)}
-Candidate Details:
-{items_desc_str}
+ML Model's Current Ranking (most recommended first):
+{ranked_display}
 
-CRITICAL INSTRUCTIONS:
-1. Listen to the user's critique carefully. Distinguish between POSITIVE MATCHES and NEGATIVE NOISE in their feedback.
-2. If the user's critique mentions POSITIVE MATCHES, you MUST keep those items near the TOP of your ranking. They are confirmed good fits.
-3. Only push DOWN items that the user explicitly marked as NEGATIVE NOISE or truly irrelevant.
-4. If you firmly believe an item from the previous list is still the best fit despite the critique, YOU MAY KEEP IT in your new ranking.
-5. Output ONLY a JSON object with keys "ranked_items" (list of Target_Names) and "explanation" (explain your adjustment).
-6. Do not add any text outside the JSON. Example format: {{"ranked_items": ["A", "B", "C"], "explanation": "..."}}"""
+INSTRUCTIONS:
+1. Listen to the user's critique carefully. Keep POSITIVE MATCHES near the TOP.
+2. Only push DOWN items the user explicitly rejected.
+3. PRESERVE the ML model's order for items not mentioned in the critique.
+4. Output ONLY a JSON: {{"ranked_items": [list of Target_Names], "explanation": "brief reason"}}
+5. Include ALL {len(cans_to_rank)} candidates. Do not add text outside the JSON."""
 
     else:
-        prompt = f"""You are a real human user on {task_type}, a platform for crowd-sourced {task_item} reviews.
-Here is your {task_type} profile and review history: {user_query}.
-Your historical {task_item} reviews show your preference as follows: ['user_id', 'review_count', 'friends', 'stars'...].
-Now you need to rank the following {len(cans_to_rank)} {task_item}: {str(cans_to_rank)} according to their match degree to your preference.
-The information of the above {len(cans_to_rank)} candidate {task_item} is as follows: {items_desc_str}.
+        prompt = f"""You are a recommendation refinement system for {task_item}s on {task_type}.
+A specialized ML recommendation model has already ranked candidate {task_item}s for this user using multiple signals (sequential behavior patterns, collaborative filtering, and content similarity). Your job is to REFINE this ranking — not rebuild it from scratch.
 
-Your final output should be ONLY a JSON object with keys "ranked_items" (list of Target_Names in sorted order) and "explanation" (brief reason).
-DO NOT introduce any other {task_item} ids!
-Please rank the more interested {task_item} more front in your rank list.
-You should think step by step before your final answer.
-IMPORTANT: DO NOT output your analysis process!
-Remember to output {task_item} Target_Names instead of {task_item} names.
-Include ALL {len(cans_to_rank)} candidates. Do not add any text outside the JSON.
-Example format: {{"ranked_items": ["A", "B", "C"], "explanation": "..."}}"""
+User's Profile & Review History:
+{user_query}
+
+ML Model's Ranking (most recommended → least recommended):
+{ranked_display}
+
+REFINEMENT INSTRUCTIONS:
+1. The ML model's ranking is based on strong statistical signals and is generally RELIABLE. Do NOT rearrange dramatically.
+2. Focus on the TOP 5 positions — getting these right matters most.
+3. Only swap two items if you see CLEAR, SPECIFIC evidence in the user's review history that a lower-ranked item better matches their preferences.
+4. Key signals: category/genre alignment, rating patterns, specific features the user mentions in reviews.
+5. When in DOUBT, PRESERVE the ML model's original order.
+6. Output ONLY a JSON: {{"ranked_items": [list of ALL {len(cans_to_rank)} Target_Names in refined order], "explanation": "reason for changes, or 'ML ranking preserved' if no changes needed"}}
+7. Use Target_Names exactly as shown. Do not introduce new items."""
 
     # ── DIALOGUE LOGGING TO FILE (for paper) ──
     import os
@@ -237,7 +256,7 @@ class Reranker:
     def _llm_only_rerank(self, data: dict, name2id: Dict[str, int], c_m: List[str], memory: List[str]) -> Tuple[List[str], Dict[str, float], str]:
         if self.llm is None: return self._embed_rerank(data, c_m, memory)
         query = _build_user_query(data, candidate_names=c_m)
-        ranked, explanation = _llm_rerank(self.llm, data, name2id, c_m, query, memory, max_candidates=len(c_m), output_dir=self.output_dir)
+        ranked, explanation = _llm_rerank(self.llm, data, name2id, c_m, query, memory, max_candidates=self.top_llm, output_dir=self.output_dir)
         return ranked, rank_to_score(ranked), explanation
 
     def _hybrid_rerank(self, data: dict, name2id: Dict[str, int], c_m: List[str], memory: List[str]) -> Tuple[List[str], Dict[str, float], str]:

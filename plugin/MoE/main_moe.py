@@ -120,6 +120,7 @@ def recommend_moe(data: dict, args) -> tuple:
     ndcg_v1 = 0.0
     ndcg_final = 0.0
     moe_only_ndcg = 0.0
+    moe_confidence = 0.0
     hit_v1 = {1: False, 3: False, 5: False}
     gate_records = []
     score_records = []
@@ -171,6 +172,9 @@ def recommend_moe(data: dict, args) -> tuple:
             if current_rank <= 1: hit_v1[1] = True
             if current_rank <= 3: hit_v1[3] = True
             if current_rank <= 5: hit_v1[5] = True
+
+            # --- MOE CONFIDENCE ---
+            moe_confidence = debug_info.get('moe_confidence', 0.0)
 
             # --- MOE ONLY NDCG ---
             c_m_top_k = debug_info.get('c_m_top_k_before_rerank', [])
@@ -267,7 +271,7 @@ def recommend_moe(data: dict, args) -> tuple:
 
         epoch += 1
 
-    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg
+    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg, moe_confidence
 
 
 def error_handler(e):
@@ -291,11 +295,12 @@ def make_counters(manager):
         'equal_count': manager.Value('i', 0),
         'gate_vals': manager.list(),
         'score_vals': manager.list(),
+        'confidence_records': manager.list(),  # (confidence, moe_ndcg, v1_ndcg)
         'lock': manager.Lock(),
     }
 
 def setcallback_safe(result, counters, args):
-    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg = result
+    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg, moe_confidence = result
     for step in data_list: append_jsonl(args.output_file, step)
 
     # --- LƯU LOG VÀO FILE ---
@@ -350,6 +355,7 @@ def setcallback_safe(result, counters, args):
         if hit_v1.get(5): counters['total_hit5_v1'].value += 1
         counters['gate_vals'].extend(gate_recs)
         counters['score_vals'].extend(score_recs)
+        counters['confidence_records'].append([moe_confidence, moe_only_ndcg, ndcg_v1])
         
         if hit_at_n.get(1): counters['correct_hit1'].value += 1
         if hit_at_n.get(3): counters['correct_hit3'].value += 1
@@ -475,6 +481,68 @@ def main(args):
             csv_path = os.path.join(output_dir, f'gating_weights_{args.dataset}.csv')
             df_gates.to_csv(csv_path, index=False)
             print(f"✅ Đã lưu file CSV Gating Logs tại: {csv_path}")
+
+        # ── CONFIDENCE vs NDCG ANALYSIS ──────────────────────────────────
+        conf_records = list(counters['confidence_records'])
+        if conf_records:
+            df_conf = pd.DataFrame(conf_records, columns=['confidence', 'moe_ndcg', 'v1_ndcg'])
+            df_conf['reranker_boost'] = df_conf['v1_ndcg'] - df_conf['moe_ndcg']
+
+            # Save raw CSV
+            conf_csv = os.path.join(output_dir, 'confidence_ndcg_analysis.csv')
+            df_conf.to_csv(conf_csv, index=False)
+            print(f"✅ Saved confidence analysis CSV: {conf_csv}")
+
+            # Bucketed analysis
+            buckets = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
+            bucket_lines = []
+            bucket_lines.append("=" * 80)
+            bucket_lines.append("📊 CONFIDENCE vs NDCG ANALYSIS (Debug — Pre-Implementation)")
+            bucket_lines.append("=" * 80)
+            bucket_lines.append(f"{'Confidence Bucket':<22} {'Count':>6} {'Avg MoE NDCG':>14} {'Avg V1 NDCG':>13} {'Avg Boost':>11} {'Reranker Helped':>16} {'Reranker Hurt':>14}")
+            bucket_lines.append("-" * 100)
+
+            for lo, hi in buckets:
+                mask = (df_conf['confidence'] >= lo) & (df_conf['confidence'] < hi)
+                subset = df_conf[mask]
+                n = len(subset)
+                if n == 0:
+                    bucket_lines.append(f"[{lo:.1f} - {hi:.1f})       {0:>6}     {'N/A':>14} {'N/A':>13} {'N/A':>11} {'N/A':>16} {'N/A':>14}")
+                    continue
+                avg_moe = subset['moe_ndcg'].mean()
+                avg_v1 = subset['v1_ndcg'].mean()
+                avg_boost = subset['reranker_boost'].mean()
+                helped = (subset['reranker_boost'] > 0).sum()
+                hurt = (subset['reranker_boost'] < 0).sum()
+                bucket_lines.append(
+                    f"[{lo:.1f} - {hi:.1f})       {n:>6}       {avg_moe:>8.4f}       {avg_v1:>7.4f}     {avg_boost:>+7.4f}          {helped:>6}        {hurt:>6}"
+                )
+            bucket_lines.append("-" * 100)
+            bucket_lines.append(
+                f"{'TOTAL':<22} {len(df_conf):>6}       {df_conf['moe_ndcg'].mean():>8.4f}       {df_conf['v1_ndcg'].mean():>7.4f}     {df_conf['reranker_boost'].mean():>+7.4f}"
+                f"          {(df_conf['reranker_boost'] > 0).sum():>6}        {(df_conf['reranker_boost'] < 0).sum():>6}"
+            )
+            bucket_lines.append("=" * 80)
+
+            # Correlation
+            from scipy.stats import spearmanr as _sp_corr
+            if len(df_conf) >= 5:
+                corr_moe, p_moe = _sp_corr(df_conf['confidence'], df_conf['moe_ndcg'])
+                corr_boost, p_boost = _sp_corr(df_conf['confidence'], df_conf['reranker_boost'])
+                bucket_lines.append(f"Spearman(confidence, moe_ndcg)       = {corr_moe:+.4f}  (p={p_moe:.4e})")
+                bucket_lines.append(f"Spearman(confidence, reranker_boost) = {corr_boost:+.4f}  (p={p_boost:.4e})")
+                bucket_lines.append("=" * 80)
+
+            conf_analysis = "\n".join(bucket_lines)
+            print(f"\n{conf_analysis}")
+
+            # Save to file
+            conf_txt = os.path.join(output_dir, 'confidence_ndcg_analysis.txt')
+            with open(conf_txt, 'w', encoding='utf-8') as f:
+                f.write(conf_analysis + "\n")
+            print(f"✅ Saved confidence analysis text: {conf_txt}")
+        # ── END CONFIDENCE ANALYSIS ──────────────────────────────────────
+
     save_final_metrics(args, total, final_hit1, final_hit3, final_hit5, final_tot_ndcg)
     
     # Ghi file thống kê tổng hợp

@@ -91,6 +91,7 @@ def gpt_api(system_prompt, user_prompt, args, few_shot=None):
         "model": args.model,
         "messages": messages,
         "temperature": args.temperature,
+        "max_tokens": 200,
     }
 
     while retry_count < max_retry_num:

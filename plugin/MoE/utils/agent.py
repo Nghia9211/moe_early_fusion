@@ -112,67 +112,86 @@ class UserModelAgent:
             self.user_build_memory = user_build_memory
             self.user_build_memory_2 = user_build_memory_2
 
+
     def act(self, data, reason=None, item_list=None, docstore_cache=None):
         if self.mode == 'prior_rec':
-            
+
             def enrich(items_input):
                 if not items_input:
                     return "None"
-                
-                items = [i.strip() for i in items_input.split(',')] if isinstance(items_input, str) else items_input
-                
+
+                items = [i.strip() for i in items_input.split(',')] \
+                        if isinstance(items_input, str) else items_input
+
                 if not docstore_cache:
-                    return ", ".join(items)
-                
+                    return ", ".join(items) if isinstance(items, list) else items_input
+
                 enriched = []
                 for item in items:
                     key = item.lower()
                     if key in docstore_cache:
                         rich_text = docstore_cache[key]
                         parts = rich_text.split(' | ')
-                        
+
                         meta_parts = []
                         for p in parts:
                             p_clean = p.strip()
-                            
                             if p_clean.lower() == key:
                                 continue
-                                
                             if ':' not in p_clean:
                                 continue
-                                
                             meta_parts.append(p_clean)
-                        
+
                         if meta_parts:
-                            # meta = " | ".join(meta_parts[:2])
                             enriched.append(f"{item} [{meta_parts[:1]}]")
                         else:
                             enriched.append(item)
                     else:
                         enriched.append(item)
-                        
+
                 return ", ".join(enriched)
-            
+
+            # Enrich purchase history (giữ nguyên như cũ)
             enriched_seq_str = enrich(data['seq_str'])
+
+            # ── PATCH: Enrich Top-5 item_list với metadata từ docstore ──────
+            # Trước: item_list được pass thẳng vào prompt dưới dạng list thô
+            # Sau:   mỗi item được thêm metadata ngắn nếu có trong cache
+            if item_list is not None and docstore_cache:
+                items_raw = item_list if isinstance(item_list, list) \
+                            else [i.strip() for i in str(item_list).split(',')]
+                enriched_item_list = enrich(items_raw)
+            else:
+                enriched_item_list = ", ".join(item_list) \
+                                    if isinstance(item_list, list) else item_list
+            # ────────────────────────────────────────────────────────────────
 
             if len(self.memory) == 0:
                 system_prompt = self.user_system_prompt.format(enriched_seq_str)
                 user_prompt = self.user_user_prompt.format(
-                    data.get('cans_str', ''),
-                    enriched_seq_str,   
-                    item_list,
+                    enriched_seq_str,
+                    enriched_item_list,   # ← dùng enriched thay vì item_list thô
                     reason,
                 )
             else:
                 system_prompt = self.user_memory_system_prompt.format(enriched_seq_str)
                 user_prompt = self.user_memory_user_prompt.format(
-                    data.get('cans_str', ''),
-                    enriched_seq_str,   
+                    enriched_seq_str,
                     '\n'.join(self.memory),
-                    item_list,
+                    enriched_item_list,   # ← dùng enriched thay vì item_list thô
                     reason,
                 )
-
+            try:
+                out_dir = os.path.dirname(getattr(self.args, 'output_file', ''))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                    log_path = os.path.join(out_dir, "user_agent_prompts.txt")
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[{data.get('id', 'Unknown User')}] === SYSTEM PROMPT ===\n{system_prompt}\n")
+                        f.write(f"[{data.get('id', 'Unknown User')}] === USER PROMPT ===\n{user_prompt}\n")
+                        f.write("=================================================================\n")
+            except Exception as e:
+                print(f"Error logging prompt: {e}")
             response = api_request(system_prompt, user_prompt, self.args)
             return response
         else:
