@@ -288,9 +288,6 @@ def train_gating_context(
     X_vl = torch.tensor(X[v_idx],        dtype=torch.float32).to(device)
     Y_vl = torch.tensor(Y_target[v_idx], dtype=torch.float32).to(device)
 
-    # v3: concentration regularization (positive = penalize uniform gates)
-    conc_w = getattr(cfg, 'concentration_weight', 0.02)
-
     best_val, best_state = float('inf'), None
 
     for epoch in range(cfg.epochs):
