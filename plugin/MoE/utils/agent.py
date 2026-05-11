@@ -155,7 +155,8 @@ class UserModelAgent:
                         encoded = enc.encode(history_review)
                         if len(encoded) > 8000: history_review = enc.decode(encoded[:8000])
                     except Exception:
-                        history_review = history_review[:15000]
+                        # Reduced from 15000 to 6000 for safety
+                        if len(history_review) > 6000: history_review = history_review[:6000]
                     parts.append(f"\n{history_review}")
                 else:
                     seq_str = data.get('seq_str', '') or ''
@@ -213,17 +214,22 @@ class UserModelAgent:
 
             if len(self.memory) == 0:
                 system_prompt = self.user_system_prompt.format(enriched_seq_str)
+                # Avoid duplicating large history in user prompt if already in system prompt
+                user_history_placeholder = "As detailed in your reading history above" 
                 user_prompt = self.user_user_prompt.format(
-                    enriched_seq_str,
-                    enriched_item_list,   # ← dùng enriched thay vì item_list thô
+                    user_history_placeholder,
+                    enriched_item_list,
                     reason,
                 )
             else:
                 system_prompt = self.user_memory_system_prompt.format(enriched_seq_str)
+                # Truncate memory to last 2 rounds to save context
+                memory_str = '\n'.join(self.memory[-2:])
+                user_history_placeholder = "As detailed in your reading history above"
                 user_prompt = self.user_memory_user_prompt.format(
-                    enriched_seq_str,
-                    '\n'.join(self.memory),
-                    enriched_item_list,   # ← dùng enriched thay vì item_list thô
+                    user_history_placeholder,
+                    memory_str,
+                    enriched_item_list,
                     reason,
                 )
             try:
@@ -255,13 +261,15 @@ class UserModelAgent:
 
     def build_memory(self, info):
         if info['user_reason'] is not None:
-            return self.user_build_memory.format(info['epoch'], info['rec_item_list'], info['rec_reason'], info['user_reason'])
+                return self.user_build_memory.format(info['epoch'], info['rec_item_list'], info['rec_reason'], info['user_reason'])
         else:
             return self.user_build_memory_2.format(info['epoch'], info['rec_item_list'], info['rec_reason'])
 
     def update_memory(self, info):
         self.info_list.append(info)
-        self.memory.append(self.build_memory(info))
+        new_memory = self.build_memory(info)
+        self.memory.append(new_memory)
+        print(f"\n[UserModelAgent] New Memory built:\n{new_memory}\n")
 
     def save_memory(self, path):
         write_jsonl(path, self.info_list)

@@ -16,7 +16,7 @@ def rank_to_score(ranked_list: List[str]) -> Dict[str, float]:
     # Điểm: 1.0, 0.63, 0.5, 0.43, 0.38...
     return {item: 1.0 / math.log2(rank + 2) for rank, item in enumerate(ranked_list)}
 
-def _build_user_query(data: dict, candidate_names: list = None) -> str:
+def _build_user_query(data: dict, candidate_names: list = None, id2name: Dict[int, str] = None) -> str:
     """Build user query string, filtering out reviews of candidate items to avoid data leakage.
     Mirrors the filter in RecHackerAgent_baseline.py line 72:
         filtered = [r for r in all_reviews if r.get('item_id') not in candidate_ids]
@@ -40,8 +40,26 @@ def _build_user_query(data: dict, candidate_names: list = None) -> str:
                 if raw_id:
                     candidate_ids.add(str(raw_id))
             if candidate_ids:
-                reviews = [r for r in reviews
-                           if str(r.get('item_id', '')) not in candidate_ids]
+                filtered_reviews = []
+                # Build mapping from raw_id -> item_name
+                rawid2name = {}
+                if id2name:
+                    rawid2name = {str(raw): id2name.get(inner) for inner, raw in id2rawid.items() if inner in id2name}
+                
+                for r in reviews:
+                    item_id_str = str(r.get('item_id', ''))
+                    if item_id_str not in candidate_ids:
+                        r_copy = dict(r)
+                        r_copy.pop('review_id', None)
+                        r_copy.pop('user_id', None)
+                        
+                        # Thêm tên item vào review
+                        item_name = rawid2name.get(item_id_str)
+                        if item_name:
+                            r_copy['item_name'] = item_name
+                        
+                        filtered_reviews.append(r_copy)
+                reviews = filtered_reviews
 
         # Convert list → string nếu cần, rồi truncate
         if isinstance(reviews, list):
@@ -232,7 +250,7 @@ REFINEMENT INSTRUCTIONS:
         return candidate_names, "Failed to parse LLM output."
 
 class Reranker:
-    def __init__(self, embedding_fn=None, llm=None, mode: str='embed_only', enabled: bool=True, top_llm: int=15, output_dir: str=None):
+    def __init__(self, embedding_fn=None, llm=None, mode: str='embed_only', enabled: bool=True, top_llm: int=20, output_dir: str=None):
         self.embedding_fn, self.llm, self.mode, self.enabled, self.top_llm = embedding_fn, llm, mode, enabled, top_llm
         self.output_dir = output_dir
 
@@ -240,27 +258,27 @@ class Reranker:
         if not self.enabled or not c_m: return c_m, rank_to_score(c_m), "Reranker disabled."
         memory = memory or []
         try:
-            if self.mode == 'embed_only': return self._embed_rerank(data, c_m, memory)
-            elif self.mode == 'llm': return self._llm_only_rerank(data, name2id, c_m, memory)
-            elif self.mode == 'hybrid': return self._hybrid_rerank(data, name2id, c_m, memory)
-            else: return self._embed_rerank(data, c_m, memory)
+            if self.mode == 'embed_only': return self._embed_rerank(data, c_m, memory, id2name)
+            elif self.mode == 'llm': return self._llm_only_rerank(data, name2id, c_m, memory, id2name)
+            elif self.mode == 'hybrid': return self._hybrid_rerank(data, name2id, c_m, memory, id2name)
+            else: return self._embed_rerank(data, c_m, memory, id2name)
         except Exception as e: return c_m, rank_to_score(c_m), f"Reranker error: {e}"
 
-    def _embed_rerank(self, data: dict, c_m: List[str], memory: List[str]) -> Tuple[List[str], Dict[str, float], str]:
-        query = _build_user_query(data)
+    def _embed_rerank(self, data: dict, c_m: List[str], memory: List[str], id2name: Dict[int, str]=None) -> Tuple[List[str], Dict[str, float], str]:
+        query = _build_user_query(data, id2name=id2name)
         if not query: return c_m, rank_to_score(c_m), "No user query available."
         sim_scores = _embed_similarity(query, c_m, {n: n for n in c_m}, self.embedding_fn)
         ranked = sorted(c_m, key=lambda n: sim_scores.get(n, 0.0), reverse=True)
         return ranked, rank_to_score(ranked), "Reranked by embedding similarity."
 
-    def _llm_only_rerank(self, data: dict, name2id: Dict[str, int], c_m: List[str], memory: List[str]) -> Tuple[List[str], Dict[str, float], str]:
-        if self.llm is None: return self._embed_rerank(data, c_m, memory)
-        query = _build_user_query(data, candidate_names=c_m)
+    def _llm_only_rerank(self, data: dict, name2id: Dict[str, int], c_m: List[str], memory: List[str], id2name: Dict[int, str]=None) -> Tuple[List[str], Dict[str, float], str]:
+        if self.llm is None: return self._embed_rerank(data, c_m, memory, id2name)
+        query = _build_user_query(data, candidate_names=c_m, id2name=id2name)
         ranked, explanation = _llm_rerank(self.llm, data, name2id, c_m, query, memory, max_candidates=self.top_llm, output_dir=self.output_dir)
         return ranked, rank_to_score(ranked), explanation
 
-    def _hybrid_rerank(self, data: dict, name2id: Dict[str, int], c_m: List[str], memory: List[str]) -> Tuple[List[str], Dict[str, float], str]:
-        query = _build_user_query(data, candidate_names=c_m)
+    def _hybrid_rerank(self, data: dict, name2id: Dict[str, int], c_m: List[str], memory: List[str], id2name: Dict[int, str]=None) -> Tuple[List[str], Dict[str, float], str]:
+        query = _build_user_query(data, candidate_names=c_m, id2name=id2name)
         sim_scores = _embed_similarity(query, c_m, {n: n for n in c_m}, self.embedding_fn)
         embed_ranked = sorted(c_m, key=lambda n: sim_scores.get(n, 0.0), reverse=True)
         if self.llm is None: return embed_ranked, rank_to_score(embed_ranked), "Fallback to embed_only"

@@ -199,7 +199,7 @@ class MoERecAgent:
             llm        = self.llm,
             mode       = getattr(self.args, 'reranker_mode', 'embed_only'),
             enabled    = self.cfg.use_reranker,
-            top_llm    = getattr(self.args, 'reranker_top_llm', 15),
+            top_llm    = 20,
             output_dir = self._output_dir,
         )
         self.combiner = ScoreCombiner(cfg=self.cfg.scoring)
@@ -290,6 +290,17 @@ class MoERecAgent:
                 for rank, item_name in enumerate(c_m)
             }
 
+            # [COMMENTED OUT Reranker for Feedback-only testing]
+            # ranked, rerank_scores, explanation = self.reranker.rerank(data=data, c_m=c_m, id2name=self.id2name, name2id=self.name2id, memory=self.memory)
+
+            # cm_fused = {name: fused_scores.get(name, 0.0) for name in c_m}
+            # c_k_raw, s1_scores, combine_debug = self.combiner.combine_from_pipeline(fused_scores=cm_fused, rerank_scores=rerank_scores, data=data, args=self.args, top_k=self.cfg.retrieval.top_M, epoch=epoch)
+
+            # c_k_sorted = sorted(c_k_raw, key=lambda x: s1_scores.get(x, 0.0), reverse=True)
+            # c_k = c_k_sorted[:self.cfg.retrieval.top_K]
+
+
+
             explanation = (
                 f"MoE recommendation (epoch={epoch}, "
                 f"gates=seq:{avg_gates.get('seq',0):.2f}/"
@@ -299,16 +310,16 @@ class MoERecAgent:
 
             debug_info = {
                 'gt_item':                  gt_item,
-                'alpha':                    1.0,            # No reranker → full MoE
+                'alpha':                    getattr(self.args, 'alpha', 0.5), # Fallback if combiner skipped
                 'moe_confidence':           moe_conf,
                 'top_M_size':               len(c_m),
                 'avg_gates':                avg_gates,
-                'c_m_top_k_before_rerank':  c_k,            # Same as final (no rerank)
+                'c_m_top_k_before_rerank':  c_m[:self.cfg.retrieval.top_K],
                 'c_k_final_after_rerank':   c_k,
-                'feedback_adjuster_state':  self.feedback_adjuster.summary() if epoch > 1 else {},
+                'feedback_adjuster_state':  self.feedback_adjuster.summary(),
                 'scores_breakdown': {
                     item_name: {
-                        's0_moe_rank': s0_rank_scores.get(item_name, 0.0),
+                        's0_moe':      fused_scores.get(item_name, 0.0),
                         's_rerank':    0.0,
                         's1_final':    fused_scores.get(item_name, 0.0),
                     }
@@ -345,7 +356,9 @@ class MoERecAgent:
 
     def update_memory(self, info: dict):
         self.info_list.append(info)
-        self.memory.append(self.build_memory(info))
+        new_memory = self.build_memory(info)
+        self.memory.append(new_memory)
+        print(f"\n[MoERecAgent] New Memory built:\n{new_memory}\n")
 
         # ── Phase 3: Cập nhật FeedbackAdjuster sau mỗi round reject ──────
         self.feedback_adjuster.update_from_memory(

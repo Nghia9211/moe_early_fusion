@@ -116,11 +116,4 @@ def get_config_for_dataset(dataset: str = None) -> MoEConfig:
     cfg.retrieval.top_K   = 5
     cfg.gating.default_weights = [1/3, 1/3, 1/3]
 
-    if dataset == 'yelp':
-        cfg.gating.default_weights = [0.50, 0.45, 0.05]
-    elif dataset == 'goodreads':
-        cfg.gating.default_weights = [0.2, 0.2, 0.6]
-    elif dataset == 'amazon':
-        cfg.gating.default_weights = [1/3, 1/3, 1/3]
-
     return cfg

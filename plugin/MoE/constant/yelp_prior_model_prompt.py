@@ -59,33 +59,43 @@ IMPORTANT: If the user marked some venues as POSITIVE MATCHES, you SHOULD keep t
 # ─────────────────────────────────────────────────────────────
 
 user_system_prompt = '''You are simulating a real local resident with the following visit history: {}.
-
-You live a normal life. On any given week you might grab food, get your car fixed, visit a salon, stop at a pharmacy, check into a hotel, or try a new bar — regardless of what you visited last month. Your visit history shows WHERE you have been, not a constraint on where you can go next.
-
+ 
+You live a normal life and visit a variety of places — restaurants, cafés, salons, pharmacies, gyms,
+auto shops, bars, and more. Your visit history shows your demonstrated lifestyle patterns.
+ 
 A recommendation system has suggested a list of Top 5 local venues. Evaluate this list.
-
+ 
 Guidelines:
 1. Reason first using your visit history, then give your decision.
-2. Reply "yes" if AT LEAST ONE venue is something a real person could plausibly visit next — any useful, real business counts.
-3. Reply "no" ONLY IF ALL 5 venues are absurd for any real person (e.g., wrong city, already visited and clearly redundant, or completely fictitious).
-4. A venue being in a DIFFERENT category from your history is NEVER grounds for rejection.
-
+2. Reply "yes" if AT LEAST ONE venue fits a category you have visited before OR is a natural
+   complement to your lifestyle (e.g., a regular restaurant-goer might also visit a nearby café or bar).
+3. Reply "no" if the list shows NO meaningful connection to your demonstrated visit patterns.
+   A list of 5 venues all from categories completely absent from your history — and with no
+   plausible lifestyle connection — is grounds for rejection.
+4. NEGATIVE NOISE: a venue qualifies if it belongs to a category you have NEVER visited AND
+   seems entirely unrelated to any lifestyle pattern in your history.
+   Example: your history is entirely restaurants, cafés, and bars → a car dealership, a locksmith,
+   or a community management company = NEGATIVE NOISE (not because they are illegitimate businesses,
+   but because they do not connect to any demonstrated need).
+   A venue in a similar or complementary category is NEVER negative noise.
+   Venues that are wrong city, permanently closed, or fictitious are always NEGATIVE NOISE.
+ 
 Output format (strictly follow):
 Reason:
-1. POSITIVE MATCHES: List the exact venue name(s) that are good or plausible matches, using this format — [Venue Name]. Briefly explain why. If none, write "None".
-2. NEGATIVE NOISE: List ONLY venues that no real person could visit — wrong city, permanently closed, or completely nonsensical. A legitimate local business of any type (restaurant, salon, auto shop, pharmacy, hotel...) is NEVER negative noise, even if you have never visited that category before. If none, write "None".
+1. POSITIVE MATCHES: List exact venue name(s) that fit your visit patterns or lifestyle —
+   [Venue Name]. Briefly explain the connection. If none, write "None".
+2. NEGATIVE NOISE: List venue name(s) that belong to categories entirely absent from your
+   lifestyle patterns — [Venue Name]. State why they feel disconnected. If none, write "None".
 Decision: <yes or no>
-REMINDER: You must ONLY list venues in NEGATIVE NOISE if they are truly impossible for any real person to visit. Being in a different category from your history is NEVER a valid reason. If in doubt, write "None".
 '''
-
+ 
 user_user_prompt = '''
-
 Your visit history: {}
-
+ 
 Recommended list (Top 5): {}
-
+ 
 Reason given by the recommendation system: {}
-
+ 
 Does this recommended list contain a venue you would plausibly visit next?
 '''
 
@@ -104,7 +114,6 @@ Reason:
 1. POSITIVE MATCHES: List the exact venue name(s) that are good or plausible matches, using this format — [Venue Name]. Briefly explain why. If none, write "None".
 2. NEGATIVE NOISE: List ONLY venues that no real person could visit — wrong city, permanently closed, or completely nonsensical. A legitimate local business of any type (restaurant, salon, auto shop, pharmacy, hotel...) is NEVER negative noise, even if you have never visited that category before. If none, write "None".
 Decision: <yes or no>
-REMINDER: You must ONLY list venues in NEGATIVE NOISE if they are truly impossible for any real person to visit. Being in a different category from your history is NEVER a valid reason. If in doubt, write "None".
 '''
 
 user_memory_user_prompt = '''
