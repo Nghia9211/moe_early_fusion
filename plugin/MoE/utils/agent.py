@@ -112,67 +112,137 @@ class UserModelAgent:
             self.user_build_memory = user_build_memory
             self.user_build_memory_2 = user_build_memory_2
 
+
     def act(self, data, reason=None, item_list=None, docstore_cache=None):
         if self.mode == 'prior_rec':
-            
-            def enrich(items_input):
-                if not items_input:
-                    return "None"
-                
-                items = [i.strip() for i in items_input.split(',')] if isinstance(items_input, str) else items_input
-                
-                if not docstore_cache:
-                    return ", ".join(items)
-                
-                enriched = []
-                for item in items:
-                    key = item.lower()
-                    if key in docstore_cache:
-                        rich_text = docstore_cache[key]
-                        parts = rich_text.split(' | ')
+
+            def build_user_query(data):
+                parts = []
+                reviews = data.get('reviews', [])
+                if reviews:
+                    if isinstance(reviews, list):
+                        id2rawid = data.get('id2rawid', self.id2rawid)
                         
-                        meta_parts = []
-                        for p in parts:
-                            p_clean = p.strip()
-                            
-                            if p_clean.lower() == key:
-                                continue
-                                
-                            if ':' not in p_clean:
-                                continue
-                                
-                            meta_parts.append(p_clean)
+                        # Build mapping from raw_id -> item_name
+                        rawid2name = {str(raw): self.id2name.get(inner) for inner, raw in id2rawid.items() if inner in self.id2name}
+
+                        candidate_ids = set()
+                        for inner_id in data.get('cans', []):
+                            raw_id = id2rawid.get(inner_id)
+                            if raw_id:
+                                candidate_ids.add(str(raw_id))
                         
-                        if meta_parts:
-                            # meta = " | ".join(meta_parts[:2])
-                            enriched.append(f"{item} [{meta_parts[:1]}]")
-                        else:
-                            enriched.append(item)
+                        filtered_reviews = []
+                        for r in reviews:
+                            item_id_str = str(r.get('item_id', ''))
+                            if item_id_str not in candidate_ids:
+                                r_copy = dict(r)
+                                r_copy.pop('review_id', None)
+                                r_copy.pop('user_id', None)
+                                
+                                # Thêm tên item vào review
+                                item_name = rawid2name.get(item_id_str)
+                                if item_name:
+                                    r_copy['item_name'] = item_name
+
+                                filtered_reviews.append(r_copy)
+                        history_review = str(filtered_reviews)
                     else:
-                        enriched.append(item)
-                        
-                return ", ".join(enriched)
-            
-            enriched_seq_str = enrich(data['seq_str'])
+                        history_review = str(reviews)
+                    try:
+                        import tiktoken
+                        enc = tiktoken.get_encoding("cl100k_base")
+                        encoded = enc.encode(history_review)
+                        if len(encoded) > 8000: history_review = enc.decode(encoded[:8000])
+                    except Exception:
+                        # Reduced from 15000 to 6000 for safety
+                        if len(history_review) > 6000: history_review = history_review[:6000]
+                    parts.append(f"\n{history_review}")
+                else:
+                    seq_str = data.get('seq_str', '') or ''
+                    if seq_str and seq_str.strip() and seq_str != 'Empty History':
+                        words = seq_str.split()
+                        parts.append(f"{' '.join(words[-80:])}")
+                return "\n\n".join(parts) if parts else ""
+
+            def enrich_candidates(items_input):
+                if not items_input: return "None"
+                items = [i.strip() for i in items_input.split(',')] if isinstance(items_input, str) else items_input
+                interaction_tool = data.get('interaction_tool')
+                id2rawid = data.get('id2rawid', self.id2rawid)
+                if not interaction_tool:
+                    return ", ".join(items) if isinstance(items, list) else items_input
+
+                enriched = []
+                keys = ['average_rating', 'stars', 'review_count', 'attributes', 'description']
+                for idx, item in enumerate(items, 1):
+                    inner_id = self.name2id.get(item)
+                    raw_id = id2rawid.get(inner_id) if inner_id is not None else None
+                    if raw_id:
+                        try:
+                            fetched = interaction_tool.get_item(item_id=raw_id)
+                            if fetched:
+                                details = []
+                                for k in keys:
+                                    v = fetched.get(k)
+                                    if v:
+                                        if k == 'description' and isinstance(v, str) and len(v) > 150:
+                                            v = v[:150] + '...'
+                                        if k == 'attributes' and isinstance(v, str) and len(v) > 100:
+                                            v = v[:100] + '...'
+                                        details.append(f"{k}: {v}")
+                                if details:
+                                    enriched.append(f'#{idx}: "{item}" — {", ".join(details)}')
+                                else:
+                                    enriched.append(f'#{idx}: "{item}"')
+                                continue
+                        except Exception: pass
+                    enriched.append(f'#{idx}: "{item}"')
+                return "\n".join(enriched)
+
+            # Build user query based on reviews to avoid data leakage
+            enriched_seq_str = build_user_query(data)
+
+            # ── PATCH: Enrich Top-5 item_list với metadata từ interaction_tool ──
+            if item_list is not None:
+                items_raw = item_list if isinstance(item_list, list) \
+                            else [i.strip() for i in str(item_list).split(',')]
+                enriched_item_list = enrich_candidates(items_raw)
+            else:
+                enriched_item_list = "None"
+            # ────────────────────────────────────────────────────────────────
 
             if len(self.memory) == 0:
                 system_prompt = self.user_system_prompt.format(enriched_seq_str)
+                # Avoid duplicating large history in user prompt if already in system prompt
+                user_history_placeholder = "As detailed in your reading history above" 
                 user_prompt = self.user_user_prompt.format(
-                    data.get('cans_str', ''),
-                    enriched_seq_str,   
-                    item_list,
+                    user_history_placeholder,
+                    enriched_item_list,
                     reason,
                 )
             else:
                 system_prompt = self.user_memory_system_prompt.format(enriched_seq_str)
+                # Truncate memory to last 2 rounds to save context
+                memory_str = '\n'.join(self.memory[-2:])
+                user_history_placeholder = "As detailed in your reading history above"
                 user_prompt = self.user_memory_user_prompt.format(
-                    data.get('cans_str', ''),
-                    enriched_seq_str,   
-                    '\n'.join(self.memory),
-                    item_list,
+                    user_history_placeholder,
+                    memory_str,
+                    enriched_item_list,
                     reason,
                 )
-
+            try:
+                out_dir = os.path.dirname(getattr(self.args, 'output_file', ''))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                    log_path = os.path.join(out_dir, "user_agent_prompts.txt")
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[{data.get('id', 'Unknown User')}] === SYSTEM PROMPT ===\n{system_prompt}\n")
+                        f.write(f"[{data.get('id', 'Unknown User')}] === USER PROMPT ===\n{user_prompt}\n")
+                        f.write("=================================================================\n")
+            except Exception as e:
+                print(f"Error logging prompt: {e}")
             response = api_request(system_prompt, user_prompt, self.args)
             return response
         else:
@@ -191,13 +261,15 @@ class UserModelAgent:
 
     def build_memory(self, info):
         if info['user_reason'] is not None:
-            return self.user_build_memory.format(info['epoch'], info['rec_item_list'], info['rec_reason'], info['user_reason'])
+                return self.user_build_memory.format(info['epoch'], info['rec_item_list'], info['rec_reason'], info['user_reason'])
         else:
             return self.user_build_memory_2.format(info['epoch'], info['rec_item_list'], info['rec_reason'])
 
     def update_memory(self, info):
         self.info_list.append(info)
-        self.memory.append(self.build_memory(info))
+        new_memory = self.build_memory(info)
+        self.memory.append(new_memory)
+        print(f"\n[UserModelAgent] New Memory built:\n{new_memory}\n")
 
     def save_memory(self, path):
         write_jsonl(path, self.info_list)

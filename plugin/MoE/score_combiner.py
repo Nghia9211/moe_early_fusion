@@ -48,6 +48,37 @@ def _scores_to_rank_scores(scores_dict: Dict[str, float]) -> Dict[str, float]:
     return rank_scores
 
 
+def moe_confidence_score(fused_scores: Dict[str, float]) -> float:
+    """
+    Đo độ tự tin của MoE dựa trên phân phối fused scores.
+    Trả về giá trị trong [0, 1]. Cao hơn = MoE tự tin hơn.
+
+    Dùng 2 signals:
+      1. Margin: khoảng cách top-1 vs top-2 (normalized by range)
+      2. Concentration: tỷ lệ score mass trong top-3 vs toàn bộ
+    """
+    if len(fused_scores) < 2:
+        return 1.0
+
+    sorted_vals = sorted(fused_scores.values(), reverse=True)
+    score_range = sorted_vals[0] - sorted_vals[-1]
+
+    if score_range == 0:
+        return 0.0  # Tất cả bằng nhau → không confidence
+
+    # Signal 1: Margin giữa top-1 và top-2
+    margin = (sorted_vals[0] - sorted_vals[1]) / score_range
+
+    # Signal 2: Concentration trong top-3 so với tổng
+    top3_mass = sum(sorted_vals[:min(3, len(sorted_vals))])
+    total_mass = sum(sorted_vals)
+    concentration = top3_mass / total_mass if total_mass > 0 else 0.5
+
+    # Combined confidence: weighted average
+    confidence = 0.6 * margin + 0.4 * concentration
+    return float(np.clip(confidence, 0.0, 1.0))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ScoreCombiner
 # ─────────────────────────────────────────────────────────────────────────────

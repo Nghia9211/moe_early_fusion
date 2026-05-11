@@ -76,9 +76,11 @@ class CandidateRetriever:
         c_sem: List[str] = []
         if self.use_semantic and self.sem_scorer is not None:
             try:
+                # Score trên candidate pool cho sẵn (direct cosine với rich text từ FAISS cache)
                 sem_scores = self.sem_scorer.score(seq_str, cans_list, data)
                 c_sem = sorted(sem_scores, key=sem_scores.get, reverse=True)[:self.cfg.top_sem]
-            except Exception as e: print(f"[CandidateRetriever] SemanticScorer error: {e}")
+            except Exception as e:
+                print(f"[CandidateRetriever] SemanticScorer error: {e}")
 
         seen = set()
         union_names: List[str] = []

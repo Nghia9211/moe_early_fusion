@@ -91,6 +91,7 @@ def gpt_api(system_prompt, user_prompt, args, few_shot=None):
         "model": args.model,
         "messages": messages,
         "temperature": args.temperature,
+        "max_tokens": 1024,
     }
 
     while retry_count < max_retry_num:
@@ -145,8 +146,8 @@ def split_rec_reponse(response):
         print("[split_rec_reponse] response is None")
         return None, None
     response = str(response) + '\n'
-    pattern = r'Reason: (.*?)\nItem: (.*?)\n'
-    matches = re.findall(pattern, response, re.DOTALL)
+    pattern = r'Reason:\s*(.*?)\nItem:\s*(.*?)\n'
+    matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
     if len(matches) != 1:
         print("[split_rec_reponse] cannot split, response =", response)
         return None, None
@@ -154,23 +155,54 @@ def split_rec_reponse(response):
 
 
 def split_user_response(response):
-    """Parse user-agent response dạng Decision: yes/no."""
+    """
+    Parse user-agent response dạng:
+        Reason: <multi-line text>
+        Decision: yes/no
+
+    Robust với:
+      - Reason nhiều dòng (POSITIVE MATCHES, NEGATIVE NOISE, ...)
+      - Decision nằm ở bất kỳ đâu sau Reason (không cần kề ngay)
+      - Khoảng trắng/newline thừa xung quanh các keyword
+      - Decision có thêm dấu chấm, ngoặc (e.g. "Yes.", "No (reason)")
+    """
     if response is None:
         print("[split_user_response] response is None")
         return None, None
-    response = str(response) + '\n'
-    pattern = r'Reason: (.*?)\nDecision: (.*?)\n'
-    matches = re.findall(pattern, response, re.DOTALL)
-    if len(matches) != 1:
-        print("[split_user_response] cannot split, response =", response)
-        return None, None
-    reason, decision = matches[0][0].strip(), matches[0][1].strip().lower()
-    if decision.startswith('yes'):
-        return reason, True
-    elif decision.startswith('no'):
-        return reason, False
-    print("[split_user_response] cannot find flag, response =", response)
-    return None, None
+
+    text = str(response).strip()
+
+    # ── Tìm Decision (ưu tiên tìm từ cuối để tránh false positive trong Reason) ──
+    decision_match = re.search(
+        r'Decision\s*:\s*(yes|no)\b',
+        text,
+        re.IGNORECASE,
+    )
+    if not decision_match:
+        # Fallback: yes/no đứng một mình ở dòng cuối cùng
+        last_line = text.strip().splitlines()[-1].strip().lower()
+        if last_line.startswith('yes'):
+            decision_val = True
+        elif last_line.startswith('no'):
+            decision_val = False
+        else:
+            print("[split_user_response] cannot split, response =", response)
+            return None, None
+    else:
+        decision_val = decision_match.group(1).lower().startswith('yes')
+
+    # ── Tách Reason: từ sau "Reason:" đến trước "Decision:" ──────────────
+    reason_match = re.search(r'Reason\s*:(.*)', text, re.IGNORECASE | re.DOTALL)
+    if reason_match:
+        reason_raw = reason_match.group(1)
+        cut = re.search(r'\nDecision\s*:', reason_raw, re.IGNORECASE)
+        if cut:
+            reason_raw = reason_raw[:cut.start()]
+        reason = reason_raw.strip()
+    else:
+        reason = text   # fallback: toàn bộ response làm reason
+
+    return reason, decision_val
 
 """
 Read And Write Process
@@ -209,4 +241,4 @@ def read_json(file_path):
             
 def write_json(file_path, data_list):
     with open(file_path, 'w', encoding='utf-8') as file:
-        json.dump(data_list, file, ensure_ascii=False, indent=4)  
+        json.dump(data_list, file, ensure_ascii=False, indent=4)

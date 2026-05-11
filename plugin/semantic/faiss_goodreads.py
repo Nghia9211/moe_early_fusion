@@ -318,7 +318,9 @@ def build_and_save(
 
             total_docs += len(documents_batch)
 
-            # Build / merge FAISS
+            # FIX v3.0: dùng merge_from() thay vì add_documents()
+            # add_documents() không normalize vectors → inconsistent với COSINE index
+            # merge_from() merge 2 FAISS objects cùng strategy → đảm bảo nhất quán
             if vector_store is None:
                 vector_store = FAISS.from_documents(
                     documents=documents_batch,
@@ -326,7 +328,12 @@ def build_and_save(
                     distance_strategy="COSINE",
                 )
             else:
-                vector_store.add_documents(documents=documents_batch)
+                batch_vs = FAISS.from_documents(
+                    documents=documents_batch,
+                    embedding=embedding_function,
+                    distance_strategy="COSINE",
+                )
+                vector_store.merge_from(batch_vs)
 
             elapsed = time.time() - start_time
             print(f"[Build] Batch {batch_count} | "

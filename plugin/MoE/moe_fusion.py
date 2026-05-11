@@ -1,8 +1,6 @@
 """
-moe_fusion.py — v2.0 (User-Context Gating inference)
+moe_fusion.py
 ────────────────────────────────────────────────────────────
-Thay đổi: MoEFusion.fuse() tính context features → predict_from_context()
-thay vì truyền item scores vào gating (tránh circular dependency).
 """
 
 import numpy as np

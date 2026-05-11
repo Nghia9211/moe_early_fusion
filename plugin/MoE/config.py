@@ -57,10 +57,8 @@ class GatingConfig:
     
     # Gating mode
     gating_mode:   str   = 'context'   # 'context' | 'score'
-    
-    # Entropy regularization — buộc gates phân tán
-    entropy_reg_weight: float = 0.15
-    
+    # Entropy regularization — buộc gates phân tán (DEPRECATED, dùng concentration_weight thay thế)
+    entropy_reg_weight: float = 0.05
     # Context feature thresholds
     max_seq_len:       int   = 50
     cold_threshold:    int   = 5
@@ -95,18 +93,17 @@ class MoEConfig:
     use_seq:      bool = True
     use_gcn:      bool = True
     use_semantic: bool = True
-    use_reranker: bool = False
-
+    use_reranker: bool = True
 
 DEFAULT_CONFIG = MoEConfig()
 
 
-def get_config_for_dataset() -> MoEConfig:
+def get_config_for_dataset(dataset: str = None) -> MoEConfig:
     """
     Trả về MoEConfig được tinh chỉnh cho từng dataset.
 
     Amazon:    GCN tốt → balanced
-    Yelp:      SASRec tốt → seq heavy
+    Yelp:      SASRec tốt → seq heavy, Semantic yếu → suppress
     Goodreads: cả GCN và SASRec fail vì sparse →
                FAISS dẫn dắt hoàn toàn
     """

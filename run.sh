@@ -1,17 +1,5 @@
 #!/bin/bash
 
-# K
-if [ -f .env ]; then
-    # Đọc file .env và export các biến
-    export $(grep -v '^#' .env | xargs)
-elif [ -f baseline/.env ]; then
-    export $(grep -v '^#' baseline/.env | xargs)
-else
-    echo "[ERROR] Not Found .env!"
-    read -p "Press Enter to exit..."
-    exit 1
-fi
-
 echo "====================================================="
 echo "1. Choose Dataset to Run Simulator"
 echo "====================================================="

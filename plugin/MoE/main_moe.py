@@ -83,21 +83,21 @@ def recommend_moe(data: dict, args) -> tuple:
     # --- FIX: KHỞI TẠO LLM ĐỘC LẬP VỚI RERANKER ---
     # Luôn cố gắng khởi tạo LLM để dùng cho Semantic Profiling (Goal 5)
     # # hoặc LLM Reranker nếu được bật.
-    # try:
-    #     from langchain_openai import ChatOpenAI
-    #     # Sử dụng api_key nếu có, ngược lại dùng "EMPTY" (thường dùng cho local LLM như vLLM/Ollama)
-    #     key = args.api_key if args.api_key and args.api_key.lower() != 'none' else "EMPTY"
-    #     llm_client = ChatOpenAI(
-    #         model=args.model, 
-    #         openai_api_key=key, 
-    #         openai_api_base=args.base_url, 
-    #         temperature=args.temperature, 
-    #         max_retries=5
-    #     )
-    # except ImportError:
-    #     print(f"[MoE] Cảnh báo: Không thể import langchain_openai cho User {user_id}")
-    # except Exception as e:
-    #     print(f"[MoE] Lỗi khởi tạo LLM cho User {user_id}: {e}")
+    try:
+        from langchain_openai import ChatOpenAI
+        # Sử dụng api_key nếu có, ngược lại dùng "EMPTY" (thường dùng cho local LLM như vLLM/Ollama)
+        key = args.api_key if args.api_key and args.api_key.lower() != 'none' else "EMPTY"
+        llm_client = ChatOpenAI(
+            model=args.model, 
+            openai_api_key=key, 
+            openai_api_base=args.base_url, 
+            temperature=args.temperature, 
+            max_retries=5
+        )
+    except ImportError:
+        print(f"[MoE] Cảnh báo: Không thể import langchain_openai cho User {user_id}")
+    except Exception as e:
+        print(f"[MoE] Lỗi khởi tạo LLM cho User {user_id}: {e}")
 
     rec_agent  = MoERecAgent(args, llm=llm_client)
     shared     = rec_agent.get_shared_sasrec()
@@ -119,6 +119,9 @@ def recommend_moe(data: dict, args) -> tuple:
     
     ndcg_v1 = 0.0
     ndcg_final = 0.0
+    moe_only_ndcg = 0.0
+    moe_confidence = 0.0
+    hit_v1 = {1: False, 3: False, 5: False}
     gate_records = []
     score_records = []
     # --------------------------------
@@ -166,6 +169,20 @@ def recommend_moe(data: dict, args) -> tuple:
 
         if epoch == 1:
             ndcg_v1 = current_ndcg
+            if current_rank <= 1: hit_v1[1] = True
+            if current_rank <= 3: hit_v1[3] = True
+            if current_rank <= 5: hit_v1[5] = True
+
+            # --- MOE CONFIDENCE ---
+            moe_confidence = debug_info.get('moe_confidence', 0.0)
+
+            # --- MOE ONLY NDCG ---
+            c_m_top_k = debug_info.get('c_m_top_k_before_rerank', [])
+            c_m_top_k_lower = [item.lower().strip() for item in c_m_top_k]
+            if gt_name_lower in c_m_top_k_lower:
+                moe_rank = c_m_top_k_lower.index(gt_name_lower) + 1
+                if moe_rank <= 5:
+                    moe_only_ndcg = 1.0 / math.log2(moe_rank + 1)
 
         # --- GATES & SCORES TRACKING ---
         # Lấy từ debug_info được truyền lên từ MoERecAgent
@@ -197,7 +214,7 @@ def recommend_moe(data: dict, args) -> tuple:
                 print(log_str)
         # ----------------------------------
 
-        max_user_retries    = 0
+        max_user_retries    = 3
         user_agent_response = None
         user_reason         = None
 
@@ -254,7 +271,7 @@ def recommend_moe(data: dict, args) -> tuple:
 
         epoch += 1
 
-    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records
+    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg, moe_confidence
 
 
 def error_handler(e):
@@ -265,19 +282,25 @@ def make_counters(manager):
     return {
         'finish_num': manager.Value('i', 0), 'correct_hit1': manager.Value('i', 0),
         'correct_hit3': manager.Value('i', 0), 'correct_hit5': manager.Value('i', 0),
+        'total_hit1_v1': manager.Value('i', 0), 'total_hit3_v1': manager.Value('i', 0), 'total_hit5_v1': manager.Value('i', 0),
         'total_ndcg5': manager.Value('d', 0.0), 'total': manager.Value('i', 0),
         'total_feedback_triggered': manager.Value('i', 0), 
         'total_rank_drops': manager.Value('i', 0),         
         'total_rank_improves': manager.Value('i', 0),
         'total_ndcg_v1': manager.Value('d', 0.0),
         'total_ndcg_final': manager.Value('d', 0.0),
+        'total_moe_only_ndcg': manager.Value('d', 0.0),
+        'moe_better_count': manager.Value('i', 0),
+        'reranker_better_count': manager.Value('i', 0),
+        'equal_count': manager.Value('i', 0),
         'gate_vals': manager.list(),
         'score_vals': manager.list(),
+        'confidence_records': manager.list(),  # (confidence, moe_ndcg, v1_ndcg)
         'lock': manager.Lock(),
     }
 
 def setcallback_safe(result, counters, args):
-    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs = result
+    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg, moe_confidence = result
     for step in data_list: append_jsonl(args.output_file, step)
 
     # --- LƯU LOG VÀO FILE ---
@@ -288,8 +311,14 @@ def setcallback_safe(result, counters, args):
         ndcg_log_path = os.path.join(output_dir, 'ndcg_comparison_log.txt')
         with open(ndcg_log_path, 'a', encoding='utf-8') as f:
             # boost = ndcg_final - ndcg_v1
-            boost = 0
+            boost = ndcg_final - ndcg_v1
             f.write(f"User: {data_list[0]['id']} | V1 NDCG: {ndcg_v1:.4f} | Final NDCG: {ndcg_final:.4f} | Boost: {boost:+.4f}\n")
+
+        # 1.5. MoE vs Reranker NDCG Comparison Log
+        moe_vs_rerank_log_path = os.path.join(output_dir, 'moe_vs_reranker_ndcg_log.txt')
+        with open(moe_vs_rerank_log_path, 'a', encoding='utf-8') as f:
+            boost_by_reranker = ndcg_v1 - moe_only_ndcg
+            f.write(f"User: {data_list[0]['id']} | MoE NDCG: {moe_only_ndcg:.4f} | Reranker NDCG: {ndcg_v1:.4f} | Reranker Boost: {boost_by_reranker:+.4f}\n")
 
         # 2. Rank Drops Log
         if drop_logs:
@@ -313,8 +342,20 @@ def setcallback_safe(result, counters, args):
         
         counters['total_ndcg_v1'].value += ndcg_v1
         counters['total_ndcg_final'].value += ndcg_final
+        counters['total_moe_only_ndcg'].value += moe_only_ndcg
+        if ndcg_v1 > moe_only_ndcg:
+            counters['reranker_better_count'].value += 1
+        elif moe_only_ndcg > ndcg_v1:
+            counters['moe_better_count'].value += 1
+        else:
+            counters['equal_count'].value += 1
+        
+        if hit_v1.get(1): counters['total_hit1_v1'].value += 1
+        if hit_v1.get(3): counters['total_hit3_v1'].value += 1
+        if hit_v1.get(5): counters['total_hit5_v1'].value += 1
         counters['gate_vals'].extend(gate_recs)
         counters['score_vals'].extend(score_recs)
+        counters['confidence_records'].append([moe_confidence, moe_only_ndcg, ndcg_v1])
         
         if hit_at_n.get(1): counters['correct_hit1'].value += 1
         if hit_at_n.get(3): counters['correct_hit3'].value += 1
@@ -385,7 +426,7 @@ def main(args):
     output_dir = os.path.dirname(args.output_file) or '.'
     
     # Reset các file log
-    for f_name in ['feedback_rank_drop_log.txt', 'feedback_rank_improve_log.txt', 'ndcg_comparison_log.txt']:
+    for f_name in ['feedback_rank_drop_log.txt', 'feedback_rank_improve_log.txt', 'ndcg_comparison_log.txt', 'moe_vs_reranker_ndcg_log.txt']:
         with open(os.path.join(output_dir, f_name), 'w', encoding='utf-8') as f:
             f.write(f"=== {f_name.upper()} ===\n")
 
@@ -411,6 +452,20 @@ def main(args):
         avg_ndcg_v1 = counters['total_ndcg_v1'].value / total if total > 0 else 0
         avg_ndcg_final = counters['total_ndcg_final'].value / total if total > 0 else 0
         
+        # Thống kê Hit Rate Boost
+        avg_hit1_v1 = counters['total_hit1_v1'].value / total if total > 0 else 0
+        avg_hit3_v1 = counters['total_hit3_v1'].value / total if total > 0 else 0
+        avg_hit5_v1 = counters['total_hit5_v1'].value / total if total > 0 else 0
+        
+        avg_hit1_final = final_hit1 / total if total > 0 else 0
+        avg_hit3_final = final_hit3 / total if total > 0 else 0
+        avg_hit5_final = final_hit5 / total if total > 0 else 0
+
+        avg_moe_only_ndcg = counters['total_moe_only_ndcg'].value / total if total > 0 else 0
+        moe_better = counters['moe_better_count'].value
+        reranker_better = counters['reranker_better_count'].value
+        equal = counters['equal_count'].value
+        
         # Thống kê Mean/Std
         all_gates = np.array(counters['gate_vals']) if counters['gate_vals'] else np.zeros((0,3))
         all_scores = np.array(counters['score_vals']) if counters['score_vals'] else np.zeros((0,2))
@@ -426,6 +481,68 @@ def main(args):
             csv_path = os.path.join(output_dir, f'gating_weights_{args.dataset}.csv')
             df_gates.to_csv(csv_path, index=False)
             print(f"✅ Đã lưu file CSV Gating Logs tại: {csv_path}")
+
+        # ── CONFIDENCE vs NDCG ANALYSIS ──────────────────────────────────
+        conf_records = list(counters['confidence_records'])
+        if conf_records:
+            df_conf = pd.DataFrame(conf_records, columns=['confidence', 'moe_ndcg', 'v1_ndcg'])
+            df_conf['reranker_boost'] = df_conf['v1_ndcg'] - df_conf['moe_ndcg']
+
+            # Save raw CSV
+            conf_csv = os.path.join(output_dir, 'confidence_ndcg_analysis.csv')
+            df_conf.to_csv(conf_csv, index=False)
+            print(f"✅ Saved confidence analysis CSV: {conf_csv}")
+
+            # Bucketed analysis
+            buckets = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
+            bucket_lines = []
+            bucket_lines.append("=" * 80)
+            bucket_lines.append("📊 CONFIDENCE vs NDCG ANALYSIS (Debug — Pre-Implementation)")
+            bucket_lines.append("=" * 80)
+            bucket_lines.append(f"{'Confidence Bucket':<22} {'Count':>6} {'Avg MoE NDCG':>14} {'Avg V1 NDCG':>13} {'Avg Boost':>11} {'Reranker Helped':>16} {'Reranker Hurt':>14}")
+            bucket_lines.append("-" * 100)
+
+            for lo, hi in buckets:
+                mask = (df_conf['confidence'] >= lo) & (df_conf['confidence'] < hi)
+                subset = df_conf[mask]
+                n = len(subset)
+                if n == 0:
+                    bucket_lines.append(f"[{lo:.1f} - {hi:.1f})       {0:>6}     {'N/A':>14} {'N/A':>13} {'N/A':>11} {'N/A':>16} {'N/A':>14}")
+                    continue
+                avg_moe = subset['moe_ndcg'].mean()
+                avg_v1 = subset['v1_ndcg'].mean()
+                avg_boost = subset['reranker_boost'].mean()
+                helped = (subset['reranker_boost'] > 0).sum()
+                hurt = (subset['reranker_boost'] < 0).sum()
+                bucket_lines.append(
+                    f"[{lo:.1f} - {hi:.1f})       {n:>6}       {avg_moe:>8.4f}       {avg_v1:>7.4f}     {avg_boost:>+7.4f}          {helped:>6}        {hurt:>6}"
+                )
+            bucket_lines.append("-" * 100)
+            bucket_lines.append(
+                f"{'TOTAL':<22} {len(df_conf):>6}       {df_conf['moe_ndcg'].mean():>8.4f}       {df_conf['v1_ndcg'].mean():>7.4f}     {df_conf['reranker_boost'].mean():>+7.4f}"
+                f"          {(df_conf['reranker_boost'] > 0).sum():>6}        {(df_conf['reranker_boost'] < 0).sum():>6}"
+            )
+            bucket_lines.append("=" * 80)
+
+            # Correlation
+            from scipy.stats import spearmanr as _sp_corr
+            if len(df_conf) >= 5:
+                corr_moe, p_moe = _sp_corr(df_conf['confidence'], df_conf['moe_ndcg'])
+                corr_boost, p_boost = _sp_corr(df_conf['confidence'], df_conf['reranker_boost'])
+                bucket_lines.append(f"Spearman(confidence, moe_ndcg)       = {corr_moe:+.4f}  (p={p_moe:.4e})")
+                bucket_lines.append(f"Spearman(confidence, reranker_boost) = {corr_boost:+.4f}  (p={p_boost:.4e})")
+                bucket_lines.append("=" * 80)
+
+            conf_analysis = "\n".join(bucket_lines)
+            print(f"\n{conf_analysis}")
+
+            # Save to file
+            conf_txt = os.path.join(output_dir, 'confidence_ndcg_analysis.txt')
+            with open(conf_txt, 'w', encoding='utf-8') as f:
+                f.write(conf_analysis + "\n")
+            print(f"✅ Saved confidence analysis text: {conf_txt}")
+        # ── END CONFIDENCE ANALYSIS ──────────────────────────────────────
+
     save_final_metrics(args, total, final_hit1, final_hit3, final_hit5, final_tot_ndcg)
     
     # Ghi file thống kê tổng hợp
@@ -435,8 +552,20 @@ def main(args):
         "📊 FEEDBACK LOOP & GATING STATISTICS\n"
         "=============================================\n"
         f"• NDCG Boost (V1 -> Final): {avg_ndcg_v1:.4f} -> {avg_ndcg_final:.4f} ({avg_ndcg_final - avg_ndcg_v1:+.4f})\n"
+        f"• Hit@1 Boost (V1 -> Final): {avg_hit1_v1:.4f} -> {avg_hit1_final:.4f} ({avg_hit1_final - avg_hit1_v1:+.4f})\n"
+        f"• Hit@3 Boost (V1 -> Final): {avg_hit3_v1:.4f} -> {avg_hit3_final:.4f} ({avg_hit3_final - avg_hit3_v1:+.4f})\n"
+        f"• Hit@5 Boost (V1 -> Final): {avg_hit5_v1:.4f} -> {avg_hit5_final:.4f} ({avg_hit5_final - avg_hit5_v1:+.4f})\n"
         f"• 📉 Rank Drops : {final_rank_drops} | 📈 Rank Improves: {final_rank_improves}\n"
         f"• 🧠 Avg Gates: Seq={gate_mean[0]:.3f}, GCN={gate_mean[1]:.3f}, Sem={gate_mean[2]:.3f}\n"
+        "=============================================\n"
+        "📊 MOE VS RERANKER (ROUND 1) STATISTICS\n"
+        "=============================================\n"
+        f"• Avg MoE Only NDCG: {avg_moe_only_ndcg:.4f}\n"
+        f"• Avg Reranker NDCG (V1): {avg_ndcg_v1:.4f}\n"
+        f"• Avg Boost by Reranker: {avg_ndcg_v1 - avg_moe_only_ndcg:+.4f}\n"
+        f"• Cases where Reranker improved MoE: {reranker_better}\n"
+        f"• Cases where Reranker worsened MoE: {moe_better}\n"
+        f"• Cases with equal performance: {equal}\n"
         "=============================================\n"
     )
     stats_path = os.path.join(output_dir, 'moe_weights_scores_stats.txt')
@@ -446,6 +575,9 @@ def main(args):
         f.write(f"Average NDCG V1 (No Feedback): {avg_ndcg_v1:.4f}\n")
         f.write(f"Average NDCG Final (With FB):  {avg_ndcg_final:.4f}\n")
         f.write(f"NDCG Boost:                   {avg_ndcg_final - avg_ndcg_v1:+.4f}\n\n")
+        f.write(f"Hit@1 V1: {avg_hit1_v1:.4f} | Final: {avg_hit1_final:.4f} | Boost: {avg_hit1_final - avg_hit1_v1:+.4f}\n")
+        f.write(f"Hit@3 V1: {avg_hit3_v1:.4f} | Final: {avg_hit3_final:.4f} | Boost: {avg_hit3_final - avg_hit3_v1:+.4f}\n")
+        f.write(f"Hit@5 V1: {avg_hit5_v1:.4f} | Final: {avg_hit5_final:.4f} | Boost: {avg_hit5_final - avg_hit5_v1:+.4f}\n\n")
         f.write("=== MOE GATING WEIGHTS (MEAN ± STD) ===\n")
         f.write(f"Seq Gate: {gate_mean[0]:.4f} ± {gate_std[0]:.4f}\n")
         f.write(f"GCN Gate: {gate_mean[1]:.4f} ± {gate_std[1]:.4f}\n")
