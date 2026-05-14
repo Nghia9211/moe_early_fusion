@@ -117,35 +117,61 @@ class UserModelAgent:
         if self.mode == 'prior_rec':
 
             def build_user_query(data):
+                # Fields to strip from review history (noise / irrelevant metadata)
+                _STRIP_FIELDS = {'date_added', 'date_updated', 'source', 'type',
+                                 'timestamp', 'image', 'sub_item_id', 'date',
+                                 'review_id', 'user_id'}
+
                 parts = []
                 reviews = data.get('reviews', [])
                 if reviews:
                     if isinstance(reviews, list):
-                        id2rawid = data.get('id2rawid', self.id2rawid)
-                        
+                        id2rawid         = data.get('id2rawid', self.id2rawid)
+                        interaction_tool = data.get('interaction_tool')
+
                         # Build mapping from raw_id -> item_name
-                        rawid2name = {str(raw): self.id2name.get(inner) for inner, raw in id2rawid.items() if inner in self.id2name}
+                        rawid2name = {str(raw): self.id2name.get(inner)
+                                      for inner, raw in id2rawid.items() if inner in self.id2name}
 
                         candidate_ids = set()
                         for inner_id in data.get('cans', []):
                             raw_id = id2rawid.get(inner_id)
                             if raw_id:
                                 candidate_ids.add(str(raw_id))
-                        
+
                         filtered_reviews = []
                         for r in reviews:
                             item_id_str = str(r.get('item_id', ''))
                             if item_id_str not in candidate_ids:
-                                r_copy = dict(r)
-                                r_copy.pop('review_id', None)
-                                r_copy.pop('user_id', None)
-                                
-                                # Thêm tên item vào review
+                                # 1. Bỏ các trường noise
+                                r_copy = {k: v for k, v in r.items() if k not in _STRIP_FIELDS}
+
+                                # 2. Thêm item_name
                                 item_name = rawid2name.get(item_id_str)
                                 if item_name:
                                     r_copy['item_name'] = item_name
 
-                                filtered_reviews.append(r_copy)
+                                # 3. Inject categories từ interaction_tool (nếu có)
+                                if interaction_tool:
+                                    try:
+                                        fetched = interaction_tool.get_item(item_id=item_id_str)
+                                        if fetched:
+                                            cats = fetched.get('categories')
+                                            if cats:
+                                                if isinstance(cats, list):
+                                                    cats = ', '.join(str(c) for c in cats)
+                                                r_copy['categories'] = cats
+                                    except Exception:
+                                        pass
+
+                                # 4. Đưa item_id và item_name lên đầu dict
+                                ordered = {}
+                                if 'item_id'    in r_copy: ordered['item_id']    = r_copy.pop('item_id')
+                                if 'item_name'  in r_copy: ordered['item_name']  = r_copy.pop('item_name')
+                                if 'categories' in r_copy: ordered['categories'] = r_copy.pop('categories')
+                                ordered.update(r_copy)  # còn lại: stars, text, ...
+
+                                filtered_reviews.append(ordered)
                         history_review = str(filtered_reviews)
                     else:
                         history_review = str(reviews)
@@ -155,7 +181,6 @@ class UserModelAgent:
                         encoded = enc.encode(history_review)
                         if len(encoded) > 8000: history_review = enc.decode(encoded[:8000])
                     except Exception:
-                        # Reduced from 15000 to 6000 for safety
                         if len(history_review) > 6000: history_review = history_review[:6000]
                     parts.append(f"\n{history_review}")
                 else:
@@ -174,7 +199,7 @@ class UserModelAgent:
                     return ", ".join(items) if isinstance(items, list) else items_input
 
                 enriched = []
-                keys = ['average_rating', 'stars', 'review_count', 'attributes', 'description']
+                keys = ['average_rating', 'stars', 'review_count', 'categories', 'description']
                 for idx, item in enumerate(items, 1):
                     inner_id = self.name2id.get(item)
                     raw_id = id2rawid.get(inner_id) if inner_id is not None else None
@@ -188,7 +213,7 @@ class UserModelAgent:
                                     if v:
                                         if k == 'description' and isinstance(v, str) and len(v) > 150:
                                             v = v[:150] + '...'
-                                        if k == 'attributes' and isinstance(v, str) and len(v) > 100:
+                                        if k == 'categories' and isinstance(v, str) and len(v) > 100:
                                             v = v[:100] + '...'
                                         details.append(f"{k}: {v}")
                                 if details:
@@ -232,18 +257,27 @@ class UserModelAgent:
                     enriched_item_list,
                     reason,
                 )
+            # Call LLM first so we can log both prompt and response together
+            response = api_request(system_prompt, user_prompt, self.args)
             try:
                 out_dir = os.path.dirname(getattr(self.args, 'output_file', ''))
                 if out_dir:
                     os.makedirs(out_dir, exist_ok=True)
                     log_path = os.path.join(out_dir, "user_agent_prompts.txt")
+                    round_num   = len(self.memory) + 1
+                    round_label = "INITIAL ROUND" if len(self.memory) == 0 else f"FEEDBACK ROUND (memory={len(self.memory)})"
+                    SEP  = "=" * 80
+                    SEP2 = "-" * 80
                     with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"\n[{data.get('id', 'Unknown User')}] === SYSTEM PROMPT ===\n{system_prompt}\n")
-                        f.write(f"[{data.get('id', 'Unknown User')}] === USER PROMPT ===\n{user_prompt}\n")
-                        f.write("=================================================================\n")
+                        f.write(f"\n{SEP}\n")
+                        f.write(f"[USER AGENT] User ID: {data.get('id', 'Unknown')} | ROUND {round_num} | {round_label}\n")
+                        f.write(f"{SEP}\n")
+                        f.write(f"[SYSTEM PROMPT]\n{SEP2}\n{system_prompt}\n{SEP2}\n")
+                        f.write(f"[USER PROMPT]\n{SEP2}\n{user_prompt}\n{SEP2}\n")
+                        f.write(f"[USER AGENT RESPONSE]\n{SEP2}\n{response}\n{SEP2}\n")
+                        f.write(f"{SEP}\n")
             except Exception as e:
                 print(f"Error logging prompt: {e}")
-            response = api_request(system_prompt, user_prompt, self.args)
             return response
         else:
             raise ValueError("Invalid mode: {}".format(self.mode))

@@ -113,17 +113,19 @@ def recommend_moe(data: dict, args) -> tuple:
     _invalid_reasons = {'', 'Could not parse user response.', 'Fallback: MoE pipeline unavailable.', 'Fallback: recommendation agent unavailable.'}
 
     # --- DEBUG TRACKING VARIABLES ---
-    gt_rank_history = {}  
-    drop_logs       = []  
-    improve_logs    = []  
-    
-    ndcg_v1 = 0.0
-    ndcg_final = 0.0
-    moe_only_ndcg = 0.0
+    gt_rank_history        = {}
+    ndcg_history           = {}   # NDCG per epoch → dùng cho Reranker impact log
+    drop_logs              = []
+    improve_logs           = []
+    reranker_impact_logs   = []   # [RERANKER BOOST/DROP] sau khi user reject
+
+    ndcg_v1        = 0.0
+    ndcg_final     = 0.0
+    moe_only_ndcg  = 0.0
     moe_confidence = 0.0
-    hit_v1 = {1: False, 3: False, 5: False}
-    gate_records = []
-    score_records = []
+    hit_v1         = {1: False, 3: False, 5: False}
+    gate_records   = []
+    score_records  = []
     # --------------------------------
 
     while not flag and epoch <= args.max_epoch:
@@ -166,6 +168,7 @@ def recommend_moe(data: dict, args) -> tuple:
             
         gt_rank_history[epoch] = current_rank
         current_ndcg = 1.0 / math.log2(current_rank + 1) if current_rank <= 5 else 0.0
+        ndcg_history[epoch] = current_ndcg
 
         if epoch == 1:
             ndcg_v1 = current_ndcg
@@ -176,7 +179,7 @@ def recommend_moe(data: dict, args) -> tuple:
             # --- MOE CONFIDENCE ---
             moe_confidence = debug_info.get('moe_confidence', 0.0)
 
-            # --- MOE ONLY NDCG ---
+            # --- MOE ONLY NDCG (before Reranker) ---
             c_m_top_k = debug_info.get('c_m_top_k_before_rerank', [])
             c_m_top_k_lower = [item.lower().strip() for item in c_m_top_k]
             if gt_name_lower in c_m_top_k_lower:
@@ -185,25 +188,24 @@ def recommend_moe(data: dict, args) -> tuple:
                     moe_only_ndcg = 1.0 / math.log2(moe_rank + 1)
 
         # --- GATES & SCORES TRACKING ---
-        # Lấy từ debug_info được truyền lên từ MoERecAgent
         gates = debug_info.get('avg_gates', {})
         if gates:
             gate_records.append([gates.get('seq', 0), gates.get('gcn', 0), gates.get('sem', 0)])
-        
-        # Thống kê phân phối s0 và s_rerank của top items
         scores = debug_info.get('scores_breakdown', {})
         for it_name, s_vals in scores.items():
             score_records.append([s_vals.get('s0_moe', 0), s_vals.get('s_rerank', 0)])
         # ----------------------------
 
         if epoch >= 2:
-            prev_rank = gt_rank_history.get(epoch - 1, 999)
+            prev_rank  = gt_rank_history.get(epoch - 1, 999)
+            prev_ndcg  = ndcg_history.get(epoch - 1, 0.0)
             prev_reason = "N/A"
             if len(rec_agent.info_list) > 0:
                 prev_reason = rec_agent.info_list[-1].get('user_reason', 'N/A').strip()
-            
+
             str_prev_rank = f"Rank {prev_rank}" if prev_rank != 999 else "Out of List"
             str_curr_rank = f"Rank {current_rank}" if current_rank != 999 else "Out of List"
+            short_reason  = (prev_reason[:120] + '...') if len(prev_reason) > 120 else prev_reason
 
             if current_rank > prev_rank:
                 log_str = f"[WARNING] User {user_id} | GT: '{gt_name}' | Rank Drop: Vòng {epoch-1} ({str_prev_rank}) -> Vòng {epoch} ({str_curr_rank}) | Lời chê trước: '{prev_reason}'"
@@ -212,6 +214,27 @@ def recommend_moe(data: dict, args) -> tuple:
                 log_str = f"[SUCCESS] User {user_id} | GT: '{gt_name}' | Rank Improve: Vòng {epoch-1} ({str_prev_rank}) -> Vòng {epoch} ({str_curr_rank}) | Lời chê trước: '{prev_reason}'"
                 improve_logs.append(log_str)
                 print(log_str)
+
+            # --- RERANKER IMPACT LOG (sau khi user reject) ---
+            ndcg_delta = current_ndcg - prev_ndcg
+            if ndcg_delta > 1e-6:
+                ri_log = (
+                    f"[RERANKER BOOST] User: {user_id} | GT: '{gt_name}' | "
+                    f"Rejection: '{short_reason}' | "
+                    f"NDCG: {prev_ndcg:.4f} -> {current_ndcg:.4f} (+{ndcg_delta:.4f}) | "
+                    f"Round: {epoch-1}->{epoch}"
+                )
+                reranker_impact_logs.append(ri_log)
+                print(ri_log)
+            elif ndcg_delta < -1e-6:
+                ri_log = (
+                    f"[RERANKER DROP]  User: {user_id} | GT: '{gt_name}' | "
+                    f"Rejection: '{short_reason}' | "
+                    f"NDCG: {prev_ndcg:.4f} -> {current_ndcg:.4f} ({ndcg_delta:.4f}) | "
+                    f"Round: {epoch-1}->{epoch}"
+                )
+                reranker_impact_logs.append(ri_log)
+            # -------------------------------------------------
         # ----------------------------------
 
         max_user_retries    = 3
@@ -271,7 +294,7 @@ def recommend_moe(data: dict, args) -> tuple:
 
         epoch += 1
 
-    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg, moe_confidence
+    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg, moe_confidence, reranker_impact_logs
 
 
 def error_handler(e):
@@ -300,7 +323,7 @@ def make_counters(manager):
     }
 
 def setcallback_safe(result, counters, args):
-    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg, moe_confidence = result
+    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg, moe_confidence, reranker_impact_logs = result
     for step in data_list: append_jsonl(args.output_file, step)
 
     # --- LƯU LOG VÀO FILE ---
@@ -331,6 +354,12 @@ def setcallback_safe(result, counters, args):
             improve_log_path = os.path.join(output_dir, 'feedback_rank_improve_log.txt')
             with open(improve_log_path, 'a', encoding='utf-8') as f:
                 for log in improve_logs: f.write(log + '\n')
+
+        # 4. Reranker Feedback Impact Log (BOOST / DROP after user rejection)
+        if reranker_impact_logs:
+            impact_log_path = os.path.join(output_dir, 'reranker_feedback_impact_log.txt')
+            with open(impact_log_path, 'a', encoding='utf-8') as f:
+                for log in reranker_impact_logs: f.write(log + '\n')
 
         # --- UPDATE COUNTERS ---
         counters['finish_num'].value += 1
@@ -426,7 +455,11 @@ def main(args):
     output_dir = os.path.dirname(args.output_file) or '.'
     
     # Reset các file log
-    for f_name in ['feedback_rank_drop_log.txt', 'feedback_rank_improve_log.txt', 'ndcg_comparison_log.txt', 'moe_vs_reranker_ndcg_log.txt']:
+    for f_name in [
+        'feedback_rank_drop_log.txt', 'feedback_rank_improve_log.txt',
+        'ndcg_comparison_log.txt', 'moe_vs_reranker_ndcg_log.txt',
+        'reranker_feedback_impact_log.txt',         # Reranker boost/drop after rejection
+    ]:
         with open(os.path.join(output_dir, f_name), 'w', encoding='utf-8') as f:
             f.write(f"=== {f_name.upper()} ===\n")
 
