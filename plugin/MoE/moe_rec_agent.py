@@ -1,9 +1,10 @@
 """
-moe_rec_agent.py — Patched: Phase 1+2+3
-  - Phase 1: Reranker bị bypass hoàn toàn (dùng pass-through embed_only
-             chỉ để build rerank_scores shape, không sort lại c_m)
-  - Phase 2: FeedbackScoreAdjuster inject vào fused_scores sau MoE fusion
-  - Phase 3: update_memory() cập nhật FeedbackAdjuster sau mỗi round reject
+moe_rec_agent.py — Reranker + Feedback Loop (No LLM Parser, No FeedbackAdjuster)
+  Flow:
+    Retrieval → MoE Fusion → Reranker (LLM, memory context từ User Agent)
+               → ScoreCombiner (s0 + s_rerank) → Top-K
+  User Agent feedback được truyền qua self.memory vào Reranker prompt mỗi round.
+  FeedbackScoreAdjuster đã bị loại bỏ hoàn toàn.
 """
 
 import os
@@ -26,7 +27,7 @@ from gating_network      import GatingNetwork
 from moe_fusion          import MoEFusion
 from reranker            import Reranker, rank_to_score
 from score_combiner      import ScoreCombiner, moe_confidence_score
-from feedback_adjuster   import FeedbackScoreAdjuster          # ← Phase 2
+# FeedbackScoreAdjuster removed — User Agent feedback handled via Reranker memory context
 
 
 class MoERecAgent:
@@ -71,19 +72,13 @@ class MoERecAgent:
             os.path.dirname(getattr(self.args, 'output_file', '') or '')
             or os.path.join(os.path.dirname(__file__), 'output')
         )
+        os.makedirs(self._output_dir, exist_ok=True)
 
         self._build_pipeline()
         self._load_build_memory_template()
 
-        # ── Phase 2: FeedbackScoreAdjuster (per-user, reset mỗi user) ────
-        self.feedback_adjuster = FeedbackScoreAdjuster(
-            negative_penalty  = getattr(args, 'fb_negative_penalty', 0.80),
-            positive_boost    = getattr(args, 'fb_positive_boost',   1.20),
-            max_penalty_rounds= getattr(args, 'fb_max_penalty',       3),
-            llm_client        = self.llm,
-            output_dir        = self._output_dir,
-            dataset           = self.dataset,   # ← truyền dataset đã detect ở dòng 51-54
-        )
+        # FeedbackScoreAdjuster removed — no separate feedback LLM call needed.
+        # User Agent rejection reason → self.memory → Reranker prompt context.
 
     # ─────────────────────────────────────────────────────────────────────
     # Shared resource init (không thay đổi)
@@ -192,12 +187,11 @@ class MoERecAgent:
         gcn_norm_ref = self.gcn_scorer.gcn_norm if self.gcn_scorer is not None else None
         self.fuser   = MoEFusion(gating=self.gating, cfg=self.cfg, gcn_norm=gcn_norm_ref)
 
-        # Giữ Reranker object để không break các import khác,
-        # nhưng Phase 1: KHÔNG gọi reranker.rerank() trong act()
+        # Reranker: LLM mode, pass memory context từ User Agent mỗi round
         self.reranker = Reranker.from_shared(
             shared     = shared,
             llm        = self.llm,
-            mode       = getattr(self.args, 'reranker_mode', 'embed_only'),
+            mode       = getattr(self.args, 'reranker_mode', 'llm'),
             enabled    = self.cfg.use_reranker,
             top_llm    = 20,
             output_dir = self._output_dir,
@@ -226,7 +220,7 @@ class MoERecAgent:
             return []
 
     # ─────────────────────────────────────────────────────────────────────
-    # act() — Phase 1: bypass Reranker | Phase 2: inject FeedbackAdjuster
+    # act() — Reranker (LLM + memory context) + ScoreCombiner
     # ─────────────────────────────────────────────────────────────────────
 
     def act(
@@ -262,66 +256,57 @@ class MoERecAgent:
             if not c_m:
                 c_m = union_names[:self.cfg.retrieval.top_M]
 
-            avg_gates  = fusion_debug.get('avg_gates', {'seq': 0.0, 'gcn': 0.0, 'sem': 0.0})
-            moe_conf   = moe_confidence_score(fused_scores)
+            avg_gates = fusion_debug.get('avg_gates', {'seq': 0.0, 'gcn': 0.0, 'sem': 0.0})
+            moe_conf  = moe_confidence_score(fused_scores)
 
-            # ── Step 3 (Phase 2): Feedback Score Adjustment ───────────────
-            # Chỉ active từ epoch 2 trở đi (epoch 1 chưa có feedback)
-            if epoch > 1:
-                fused_scores = self.feedback_adjuster.adjust(fused_scores)
-                # Re-sort c_m theo adjusted scores
-                c_m = sorted(
-                    fused_scores,
-                    key=lambda x: fused_scores.get(x, 0.0),
-                    reverse=True,
-                )[:self.cfg.retrieval.top_M]
-                print(
-                    f"[FeedbackAdjuster] epoch={epoch} | "
-                    f"rejected={self.feedback_adjuster.get_rejected_items()} | "
-                    f"praised={self.feedback_adjuster.get_praised_items()}"
-                )
+            # ── Step 3: Reranker (LLM, with User Agent memory context) ────
+            # self.memory chứa feedback từ User Agent các round trước
+            # → _llm_rerank tự động inject vào prompt ở round >= 2
+            ranked, rerank_scores, explanation = self.reranker.rerank(
+                data     = data,
+                c_m      = c_m,
+                id2name  = self.id2name,
+                name2id  = self.name2id,
+                memory   = self.memory,
+            )
 
-            # ── Step 4 (Phase 1): Direct top-K — NO Reranker ─────────────
-            c_k = c_m[:self.cfg.retrieval.top_K]
+            # ── Step 4: ScoreCombiner (s0_moe + s_rerank) ────────────────
+            cm_fused = {name: fused_scores.get(name, 0.0) for name in c_m}
+            c_k_raw, s1_scores, combine_debug = self.combiner.combine_from_pipeline(
+                fused_scores  = cm_fused,
+                rerank_scores = rerank_scores,
+                data          = data,
+                args          = self.args,
+                top_k         = self.cfg.retrieval.top_M,
+                epoch         = epoch,
+            )
 
-            # Build s0 rank scores cho debug
-            s0_rank_scores = {
-                item_name: 1.0 / math.log2(rank + 2)
-                for rank, item_name in enumerate(c_m)
-            }
+            # ── Step 5: Final Top-K ───────────────────────────────────────
+            c_k_sorted = sorted(c_k_raw, key=lambda x: s1_scores.get(x, 0.0), reverse=True)
+            c_k = c_k_sorted[:self.cfg.retrieval.top_K]
 
-            # [COMMENTED OUT Reranker for Feedback-only testing]
-            # ranked, rerank_scores, explanation = self.reranker.rerank(data=data, c_m=c_m, id2name=self.id2name, name2id=self.name2id, memory=self.memory)
-
-            # cm_fused = {name: fused_scores.get(name, 0.0) for name in c_m}
-            # c_k_raw, s1_scores, combine_debug = self.combiner.combine_from_pipeline(fused_scores=cm_fused, rerank_scores=rerank_scores, data=data, args=self.args, top_k=self.cfg.retrieval.top_M, epoch=epoch)
-
-            # c_k_sorted = sorted(c_k_raw, key=lambda x: s1_scores.get(x, 0.0), reverse=True)
-            # c_k = c_k_sorted[:self.cfg.retrieval.top_K]
-
-
-
-            explanation = (
-                f"MoE recommendation (epoch={epoch}, "
+            print(
+                f"[MoERecAgent] epoch={epoch} | "
                 f"gates=seq:{avg_gates.get('seq',0):.2f}/"
                 f"gcn:{avg_gates.get('gcn',0):.2f}/"
-                f"sem:{avg_gates.get('sem',0):.2f})"
+                f"sem:{avg_gates.get('sem',0):.2f} | "
+                f"alpha={combine_debug.get('alpha', 0.5):.2f} | "
+                f"memory_rounds={len(self.memory)}"
             )
 
             debug_info = {
-                'gt_item':                  gt_item,
-                'alpha':                    getattr(self.args, 'alpha', 0.5), # Fallback if combiner skipped
-                'moe_confidence':           moe_conf,
-                'top_M_size':               len(c_m),
-                'avg_gates':                avg_gates,
-                'c_m_top_k_before_rerank':  c_m[:self.cfg.retrieval.top_K],
-                'c_k_final_after_rerank':   c_k,
-                'feedback_adjuster_state':  self.feedback_adjuster.summary(),
+                'gt_item':                 gt_item,
+                'alpha':                   combine_debug.get('alpha', 0.5),
+                'moe_confidence':          moe_conf,
+                'top_M_size':              len(c_m),
+                'avg_gates':               avg_gates,
+                'c_m_top_k_before_rerank': c_m[:self.cfg.retrieval.top_K],
+                'c_k_final_after_rerank':  c_k,
                 'scores_breakdown': {
                     item_name: {
-                        's0_moe':      fused_scores.get(item_name, 0.0),
-                        's_rerank':    0.0,
-                        's1_final':    fused_scores.get(item_name, 0.0),
+                        's0_moe':   fused_scores.get(item_name, 0.0),
+                        's_rerank': rerank_scores.get(item_name, 0.0),
+                        's1_final': s1_scores.get(item_name, 0.0),
                     }
                     for item_name in c_k
                 },
@@ -359,12 +344,8 @@ class MoERecAgent:
         new_memory = self.build_memory(info)
         self.memory.append(new_memory)
         print(f"\n[MoERecAgent] New Memory built:\n{new_memory}\n")
-
-        # ── Phase 3: Cập nhật FeedbackAdjuster sau mỗi round reject ──────
-        self.feedback_adjuster.update_from_memory(
-            user_reason    = info.get('user_reason', ''),
-            rec_item_list  = info.get('rec_item_list', []),
-        )
+        # User Agent rejection reason đã được append vào self.memory
+        # → Reranker tự động nhận context này ở round tiếp theo (qua memory param)
 
     # ─────────────────────────────────────────────────────────────────────
     # Helpers (không thay đổi)

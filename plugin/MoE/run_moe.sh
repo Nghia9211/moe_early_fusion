@@ -10,13 +10,14 @@ work_dir="."
 cd "$work_dir"
 
 # ── Dataset List & Scenario ───────────────────────────────────────────────
-# DATASETS=( "goodreads" "amazon")
-# DATASETS=("amazon")
-DATASETS=("goodreads" "yelp" "amazon")
+# DATASETS=( "yelp" "amazon")
+# DATASETS=( "goodreads" "yelp")
+DATASETS=("amazon")
+# DATASETS=("goodreads" "yelp" "amazon")
 
 # Đổi SCENARIO thành mảng để loop
-SCENARIOS=("user_cold_start" "classic")
-# SCENARIOS=("classic")
+# SCENARIOS=("user_cold_start" "classic")
+SCENARIOS=("classic")
 
 # ── Global Configs (Dùng chung cho cả 3) ──────────────────────────────────
 STAGE="test"
@@ -26,7 +27,7 @@ MAX_SAMPLES=-1    # -1 = toàn bộ dataset
 MP=16
 SEED=303
 TEMPERATURE="0.0"
-RERANKER_MODE="embed_only"     # llm | embed_only | hybrid
+RERANKER_MODE="llm"                # llm | embed_only | hybrid
 MODEL="${MODEL:-qwen-research}"
 API_KEY="${API_KEY:-EMPTY}"
 BASE_URL="http://localhost:11435/v1"
@@ -51,7 +52,7 @@ for DS in "${DATASETS[@]}"; do
 
         # --- Định nghĩa Output riêng cho từng Dataset ---
         P_MODEL="SASRec_MoE"
-        NAME="moe_fbl_llm_parser_final"
+        NAME="moe_rerank_fbl_v9_full"
         OUTPUT_FILE="./output/${DS}_${SCENARIO}_${NAME}/${P_MODEL}_${MODEL}_SEED${SEED}_ep${MAX_EPOCH}.jsonl"
         RESULT_FILE="./output/${DS}_${SCENARIO}_${NAME}/evaluation_results_${NAME}_${DS}.json"
         # Tạo thư mục output
