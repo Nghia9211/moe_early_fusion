@@ -54,6 +54,12 @@ class MoERecAgent:
             'amazon'
         )
         self.cfg = get_config_for_dataset(dataset=self.dataset)
+        
+        # Override use_reranker / use_user_agent from CLI args
+        if hasattr(args, 'use_reranker'):
+            self.cfg.use_reranker = args.use_reranker
+        if hasattr(args, 'use_user_agent'):
+            self.cfg.use_user_agent = args.use_user_agent
 
         with MoERecAgent._init_lock:
             self._init_shared_resources(args)
@@ -188,14 +194,19 @@ class MoERecAgent:
         self.fuser   = MoEFusion(gating=self.gating, cfg=self.cfg, gcn_norm=gcn_norm_ref)
 
         # Reranker: LLM mode, pass memory context từ User Agent mỗi round
+        # Khi use_reranker=False → enabled=False, llm=None → Reranker returns identity
+        reranker_enabled = self.cfg.use_reranker
+        reranker_llm     = self.llm if reranker_enabled else None
         self.reranker = Reranker.from_shared(
             shared     = shared,
-            llm        = self.llm,
+            llm        = reranker_llm,
             mode       = getattr(self.args, 'reranker_mode', 'llm'),
-            enabled    = self.cfg.use_reranker,
+            enabled    = reranker_enabled,
             top_llm    = 20,
             output_dir = self._output_dir,
         )
+        if not reranker_enabled:
+            print("[MoERecAgent] Reranker DISABLED — will return MoE fusion order as-is.")
         self.combiner = ScoreCombiner(cfg=self.cfg.scoring)
 
     # ─────────────────────────────────────────────────────────────────────

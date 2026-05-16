@@ -58,18 +58,8 @@ class MyRecommendationAgent(RecommendationAgent):
     def workflow(self):
         dataset = task_set.lower()
 
-        if dataset == 'amazon':
-            item_keys = ['item_id', 'title', 'description', 'categories', 'price', 'brand']
-            rev_keys  = ['item_id', 'rating', 'review_text', 'summary', 'timestamp']
-        elif dataset == 'yelp':
-            item_keys = ['item_id', 'name', 'stars', 'review_count', 'attributes', 'categories']
-            rev_keys  = ['item_id', 'stars', 'text', 'useful', 'funny', 'cool', 'date']
-        elif dataset == 'goodreads':
-            item_keys = ['item_id', 'title', 'authors', 'publication_year', 'average_rating', 'description', 'similar_books']
-            rev_keys  = ['item_id', 'stars', 'text', 'date_added', 'n_votes', 'n_comments']
-        else:
-            item_keys = ['item_id', 'name', 'title', 'stars', 'description']
-            rev_keys  = ['item_id', 'rating', 'stars', 'text', 'review_text']
+        item_keys = ['item_id', 'name', 'title', 'stars', 'description','review_count','attributes', 'title', 'average_rating','rating_number', 'description', 'ratings_count', 'title_without_series' ]
+        rev_keys  = ['item_id', 'rating', 'stars', 'text', 'timestamp', 'verified_purchase', 'title', 'helpful_vote']
 
         all_reviews   = self.interaction_tool.get_reviews(user_id=self.task['user_id'])
         candidate_ids = set(self.task['candidate_list'])
@@ -78,9 +68,8 @@ class MyRecommendationAgent(RecommendationAgent):
             {k: r.get(k) for k in rev_keys if k in r}
             for r in all_reviews if r.get('item_id') not in candidate_ids
         ]
-        filtered_sorted = sorted(filtered_reviews, key=get_review_time)  ## sort review theo thời gian 
 
-        history_review = str(filtered_sorted[-15:])
+        history_review = str(filtered_reviews) 
 
         if num_tokens_from_string(history_review) > 8000:
             enc = tiktoken.get_encoding("cl100k_base")
@@ -103,6 +92,7 @@ Your final output should be ONLY a ranked item list of {self.task['candidate_lis
 DO NOT output your analysis process!
 The correct output format: [Sorted Candidate Item List]
 """.strip()
+        print(f"task_description: {task_description} \n")
 
         result = self.reasoning(task_description)
 
@@ -129,22 +119,29 @@ if __name__ == "__main__":
     load_dotenv()
     llm = OpenAILLM(
     api_key="EMPTY", 
-    model="qwen-small", 
-    base_url="http://localhost:8036/v1"
+    model="qwen-research", 
+    base_url="http://localhost:11435/v1"
     )
+
 
     simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
     simulator.set_task_and_groundtruth(
-        task_dir=f"../dataset/tasks5/{scenario}/{task_set}/tasks",
-        groundtruth_dir=f"../dataset/tasks5/{scenario}/{task_set}/groundtruth",
+        task_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/tasks",
+        groundtruth_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/groundtruth",
     )
+
+    # simulator = Simulator(data_dir="../musical_industrial/industrial_amazon", device="gpu", cache=True)
+    # simulator.set_task_and_groundtruth(
+    #     task_dir=f"../musical_industrial/industrial_amazon/task5_industrial_amazon/{scenario}/amazon_industrial/tasks",
+    #     groundtruth_dir=f"../musical_industrial/industrial_amazon/task5_industrial_amazon/{scenario}/amazon_industrial/groundtruth",
+    # )
     simulator.set_agent(MyRecommendationAgent)
     simulator.set_llm(llm)
 
-    agent_outputs      = simulator.run_simulation(number_of_tasks=500, enable_threading=True, max_workers=20)
+    agent_outputs      = simulator.run_simulation(number_of_tasks=None, enable_threading=True, max_workers=16)
     evaluation_results = simulator.evaluate()
 
     os.makedirs(f'./results/{scenario}', exist_ok=True)
-    with open(f'./results/{scenario}/evaluation_results_DummyAgent_{task_set}.json', 'w') as f:
+    with open(f'./results/{scenario}/evaluation_results_DummyAgent_{task_set}_videogame.json', 'w') as f:
         json.dump(evaluation_results, f, indent=4)
     print(f"The evaluation_results for {task_set} is: {evaluation_results}")

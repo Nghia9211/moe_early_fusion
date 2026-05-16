@@ -8,10 +8,32 @@ Feedback Loop 4.0:
 import json
 import re
 import traceback
+import threading
 from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel
 import numpy as np
 import math
+
+# ── Module-level tiktoken cache (tránh load BPE vocab lại mỗi call) ──────────
+try:
+    import tiktoken as _tiktoken
+    _TIKTOKEN_ENC = _tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
+
+# ── Module-level item metadata cache (thread-safe) ───────────────────────────
+_item_cache: Dict[str, dict] = {}
+_item_cache_lock = threading.Lock()
+
+def _cached_get_item(tool, raw_id: str):
+    """Fetch item metadata với cache để tránh gọi lại cùng raw_id nhiều lần."""
+    with _item_cache_lock:
+        if raw_id in _item_cache:
+            return _item_cache[raw_id]
+    result = tool.get_item(item_id=raw_id)
+    with _item_cache_lock:
+        _item_cache[raw_id] = result
+    return result
 
 # ── Structured output schema for LLM reranker ────────────────────────────
 class _RankerOutput(BaseModel):
@@ -93,10 +115,11 @@ def _build_user_query(data: dict, candidate_names: list = None, id2name: Dict[in
         else:
             history_review = reviews
         try:
-            import tiktoken
-            enc = tiktoken.get_encoding("cl100k_base")
-            encoded = enc.encode(history_review)
-            if len(encoded) > 8000: history_review = enc.decode(encoded[:8000])
+            if _TIKTOKEN_ENC is not None:
+                encoded = _TIKTOKEN_ENC.encode(history_review)
+                if len(encoded) > 8000: history_review = _TIKTOKEN_ENC.decode(encoded[:8000])
+            else:
+                history_review = history_review[:15000]
         except Exception:
             history_review = history_review[:15000]
         parts.append(f"\n{history_review}")
@@ -146,7 +169,7 @@ def _llm_rerank(
             info_dict = {'Target_Name': name}
             if raw_id:
                 try:
-                    fetched = interaction_tool.get_item(item_id=raw_id)
+                    fetched = _cached_get_item(interaction_tool, raw_id)
                     if fetched:
                         for k in keys:
                             if k in fetched: info_dict[k] = fetched[k]
@@ -174,10 +197,11 @@ def _llm_rerank(
     ranked_display = "\n".join(numbered_lines)
 
     try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        encoded_items = enc.encode(ranked_display)
-        if len(encoded_items) > 6000: ranked_display = enc.decode(encoded_items[:6000])
+        if _TIKTOKEN_ENC is not None:
+            encoded_items = _TIKTOKEN_ENC.encode(ranked_display)
+            if len(encoded_items) > 6000: ranked_display = _TIKTOKEN_ENC.decode(encoded_items[:6000])
+        else:
+            ranked_display = ranked_display[:25000]
     except Exception:
         ranked_display = ranked_display[:25000]
 
