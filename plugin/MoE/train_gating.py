@@ -2,10 +2,8 @@
 train_gating.py — v2.1 (User-Context Gating, 5-feature)
 ────────────────────────────────────────────────────────────────────
 Thay đổi so với v2.0:
-  - input_dim = 5  (bỏ cold_start_flag, gcn_coverage, seq_entropy)
-  - Thêm gcn_confidence + sem_confidence vào build_context_feature
-  - print_feature_report cập nhật labels
-  - Các tham số khác giữ nguyên (KL + entropy reg, balanced target)
+  - input_dim = 7 
+  - CE + entropy reg, balanced target
 """
 
 import os, sys, argparse, math, numpy as np, pandas as pd
@@ -171,19 +169,18 @@ def compute_batch_scores(batch_seqs, batch_lens, batch_pools,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build training data — 5-feature context + KL target
+# Build training data — 7-feature context + CE target
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_training_data_context(
     loader, seq_scorer, gcn_scorer, sem_scorer,
     id2name, cfg: GatingConfig,
-    temperature:  float = 2.0,
     balance_eps:  float = 0.05,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
         X : (N, 5) context features
-        Y : (N, 3) KL target gate distribution
+        Y : (N, 3) CE target gate distribution
     """
     X_list, Y_list = [], []
     gcn_norm = gcn_scorer.gcn_norm if gcn_scorer else None
@@ -217,7 +214,7 @@ def build_training_data_context(
             len_seq_i = int(lens[i])
             seq_list  = seqs[i].tolist()
 
-            # ── 5-feature context vector ─────────────────────────────────────
+            # ── 7-feature context vector ─────────────────────────────────────
             ctx = build_context_feature(
                 seq_list, len_seq_i, s_seq, s_gcn, s_sem, gcn_norm, cfg
             )
@@ -265,9 +262,7 @@ def train_gating_context(
     val_ratio: float = 0.1,
 ) -> GatingMLP:
     """
-    Train GatingMLP với KL-Divergence loss + Entropy regularization.
-
-    Loss = KL(target || predicted) - entropy_weight * H(predicted)
+    Train GatingMLP với Cross Entropy loss + Entropy regularization.
     Entropy bonus buộc gates phân tán, tránh collapse về 1 expert.
     """
     n     = len(X)
@@ -362,7 +357,6 @@ def main():
     parser.add_argument('--epochs',      type=int,   default=50)
     parser.add_argument('--lr',          type=float, default=1e-3)
     parser.add_argument('--batch_size',  type=int,   default=256)
-    parser.add_argument('--kl_temp',     type=float, default=1.0)
     parser.add_argument('--balance_eps', type=float, default=0.1,
                         help='v3: expert quality threshold. Experts with NDCG < this → gate=0')
     parser.add_argument('--entropy_reg', type=float, default=0.0,
@@ -450,7 +444,7 @@ def main():
     print('\n📦 Building context training data (7-feature v2.2)...')
     X_raw, Y_target = build_training_data_context(
         loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
-        cfg=cfg, temperature=args.kl_temp, balance_eps=args.balance_eps,
+        cfg=cfg, balance_eps=args.balance_eps,
     )
     print(f'Training samples: {len(X_raw):,}')
     print_feature_report(X_raw)
