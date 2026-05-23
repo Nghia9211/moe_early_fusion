@@ -47,7 +47,7 @@ def get_args():
     parser.add_argument('--item_mapping_file', type=str, default=None)
     parser.add_argument('--raw_data_dir',      type=str, default=None)
     parser.add_argument('--stage',             type=str, default='test', choices=['train', 'val', 'test'])
-    parser.add_argument('--dataset',           type=str, default='amazon', choices=['amazon', 'yelp', 'goodreads'])
+    parser.add_argument('--dataset',           type=str, default='amazon', choices=['amazon', 'yelp', 'goodreads', 'amazon_musical', 'amazon_industrial'])
     parser.add_argument('--cans_num',  type=int, default=20)
     parser.add_argument('--max_epoch', type=int, default=3)
     parser.add_argument('--faiss_db_path', type=str, default=None)
@@ -56,6 +56,8 @@ def get_args():
     parser.add_argument('--gating_model_path', type=str, default=None)
     parser.add_argument('--reranker_mode', type=str, default='embed_only', choices=['embed_only', 'llm', 'hybrid'])
     parser.add_argument('--reranker_top_llm', type=int, default=15)
+    parser.add_argument('--use_reranker',   type=lambda x: x.lower() in ('true','1','yes'), default=True, help='Enable/disable Reranker LLM (default: True)')
+    parser.add_argument('--use_user_agent', type=lambda x: x.lower() in ('true','1','yes'), default=True, help='Enable/disable User Agent LLM (default: True)')
     parser.add_argument('--rerank_only', action='store_true')
     parser.add_argument('--model',       type=str, default='qwen-small')
     parser.add_argument('--api_key',     type=str, default=None)
@@ -80,28 +82,34 @@ def recommend_moe(data: dict, args) -> tuple:
     user_id    = data.get('id')
     llm_client = None
     
-    # --- FIX: KHỞI TẠO LLM ĐỘC LẬP VỚI RERANKER ---
-    # Luôn cố gắng khởi tạo LLM để dùng cho Semantic Profiling (Goal 5)
-    # # hoặc LLM Reranker nếu được bật.
-    try:
-        from langchain_openai import ChatOpenAI
-        # Sử dụng api_key nếu có, ngược lại dùng "EMPTY" (thường dùng cho local LLM như vLLM/Ollama)
-        key = args.api_key if args.api_key and args.api_key.lower() != 'none' else "EMPTY"
-        llm_client = ChatOpenAI(
-            model=args.model, 
-            openai_api_key=key, 
-            openai_api_base=args.base_url, 
-            temperature=args.temperature, 
-            max_retries=5
-        )
-    except ImportError:
-        print(f"[MoE] Cảnh báo: Không thể import langchain_openai cho User {user_id}")
-    except Exception as e:
-        print(f"[MoE] Lỗi khởi tạo LLM cho User {user_id}: {e}")
+    # --- KHỞI TẠO LLM CHỈ KHI CẦN (Reranker LLM hoặc User Agent) ---
+    need_llm = getattr(args, 'use_reranker', True) or getattr(args, 'use_user_agent', True)
+    if need_llm:
+        try:
+            from langchain_openai import ChatOpenAI
+            key = args.api_key if args.api_key and args.api_key.lower() != 'none' else "EMPTY"
+            llm_client = ChatOpenAI(
+                model=args.model, 
+                openai_api_key=key, 
+                openai_api_base=args.base_url, 
+                temperature=args.temperature, 
+                max_retries=5,
+                request_timeout=120,     # Thêm timeout (giây) để tránh bị treo vĩnh viễn khi vLLM nghẽn
+                max_tokens=800           # CHỐNG KẸT: Cắt đứt ngay nếu LLM sinh text vô tận
+            )
+        except ImportError:
+            print(f"[MoE] Cảnh báo: Không thể import langchain_openai cho User {user_id}")
+        except Exception as e:
+            print(f"[MoE] Lỗi khởi tạo LLM cho User {user_id}: {e}")
+    else:
+        print(f"[MoE][User {user_id}] Skipping LLM init (use_reranker={getattr(args, 'use_reranker', True)}, use_user_agent={getattr(args, 'use_user_agent', True)})")
 
     rec_agent  = MoERecAgent(args, llm=llm_client)
     shared     = rec_agent.get_shared_sasrec()
-    user_agent = UserModelAgent(args, shared_sasrec=shared)
+    
+    # User Agent: chỉ khởi tạo khi được bật
+    use_user_agent = getattr(args, 'use_user_agent', True)
+    user_agent = UserModelAgent(args, shared_sasrec=shared) if use_user_agent else None
 
     flag          = False
     epoch         = 1
@@ -128,7 +136,10 @@ def recommend_moe(data: dict, args) -> tuple:
     score_records  = []
     # --------------------------------
 
-    while not flag and epoch <= args.max_epoch:
+    # Nếu User Agent bị tắt, chỉ chạy 1 round (không feedback loop)
+    effective_max_epoch = args.max_epoch if use_user_agent else 1
+    
+    while not flag and epoch <= effective_max_epoch:
         prefix = f"[MoE][User {user_id}][Round {epoch}]"
 
         max_retries      = 3
@@ -193,7 +204,7 @@ def recommend_moe(data: dict, args) -> tuple:
             gate_records.append([gates.get('seq', 0), gates.get('gcn', 0), gates.get('sem', 0)])
         scores = debug_info.get('scores_breakdown', {})
         for it_name, s_vals in scores.items():
-            score_records.append([s_vals.get('s0_moe', 0), s_vals.get('s_rerank', 0)])
+            score_records.append([s_vals.get('s0_moe_rank', s_vals.get('s0_moe', 0.0)), s_vals.get('s_rerank', 0.0)])
         # ----------------------------
 
         if epoch >= 2:
@@ -241,19 +252,25 @@ def recommend_moe(data: dict, args) -> tuple:
         user_agent_response = None
         user_reason         = None
 
-        for attempt in range(max_user_retries):
-            # Lấy Cache từ SemanticScorer (nằm trong MoERecAgent)
-            cache = rec_agent.sem_scorer._docstore_cache if hasattr(rec_agent, 'sem_scorer') else None
-            
-            # Truyền cache vào hàm act
-            user_agent_response = user_agent.act(data, rec_reason, rec_item_list, docstore_cache=cache)
-            user_reason, flag   = split_user_response(user_agent_response)
-            if user_reason is not None and flag is not None:
-                break
-            time.sleep(1)
+        if use_user_agent and user_agent is not None:
+            for attempt in range(max_user_retries):
+                # Lấy Cache từ SemanticScorer (nằm trong MoERecAgent)
+                cache = rec_agent.sem_scorer._docstore_cache if hasattr(rec_agent, 'sem_scorer') else None
+                
+                # Truyền cache vào hàm act
+                user_agent_response = user_agent.act(data, rec_reason, rec_item_list, docstore_cache=cache)
+                user_reason, flag   = split_user_response(user_agent_response)
+                if user_reason is not None and flag is not None:
+                    break
+                time.sleep(1)
+            else:
+                user_reason = "Could not parse user response."
+                flag        = False
         else:
-            user_reason = "Could not parse user response."
-            flag        = False
+            # User Agent disabled → accept recommendation immediately (no feedback loop)
+            user_agent_response = "User Agent disabled — auto-accepting."
+            user_reason = None
+            flag = True
 
         user_reason_clean = (user_reason or '').strip()
         
@@ -290,7 +307,8 @@ def recommend_moe(data: dict, args) -> tuple:
                 'user_reason':   user_reason,
             }
             rec_agent.update_memory(memory_info)
-            user_agent.update_memory(memory_info)
+            if use_user_agent and user_agent is not None:
+                user_agent.update_memory(memory_info)
 
         epoch += 1
 

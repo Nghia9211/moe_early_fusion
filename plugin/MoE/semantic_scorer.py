@@ -63,9 +63,11 @@ class SemanticScorer:
             print(f"[SemanticScorer] Docstore cache init error: {e}")
 
     def _get_candidate_texts(self, candidate_names: List[str]) -> List[str]:
+        import re
         texts = []
         for name in candidate_names:
-            rich = self._docstore_cache.get(name.lower().strip())
+            clean_name = re.sub(r'\s+\[.*?\]$', '', name).strip().lower()
+            rich = self._docstore_cache.get(clean_name)
             if rich:
                 self._cache_hits += 1
                 texts.append(rich)

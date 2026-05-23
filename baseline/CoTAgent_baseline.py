@@ -12,26 +12,6 @@ import os
 from dotenv import load_dotenv
 
 from datetime import datetime
-
-def get_review_time(r):
-    try:
-        if r.get('source') == 'amazon':
-            return float(r.get('timestamp', 0))  # dùng trực tiếp
-
-        elif r.get('source') == 'yelp':
-            return datetime.strptime(
-                r.get('date'),
-                "%Y16%m-%d %H:%M:%S"
-            ).timestamp()
-
-        elif r.get('source') == 'goodreads':
-            return datetime.strptime(
-                r.get('date_added'),
-                "%a %b %d %H:%M:%S %z %Y"
-            ).timestamp()
-    except:
-        return 0.0
-
 logging.basicConfig(level=logging.INFO)
 
 
@@ -76,11 +56,7 @@ class MyRecommendationAgent(RecommendationAgent):
                 all_reviews    = self.interaction_tool.get_reviews(user_id=self.task['user_id'])
                 candidate_ids  = set(self.task['candidate_list'])
                 filtered       = [r for r in all_reviews if r.get('item_id') not in candidate_ids]
-
-                filtered_sorted = sorted(filtered, key=get_review_time)  ## sort review theo thời gian 
-
-                history_str = str(filtered_sorted[-15:]) 
-                history_review = str(history_str)
+                history_review = str(filtered)
                 if num_tokens_from_string(history_review) > 8000:
                     enc = tiktoken.get_encoding("cl100k_base")
                     history_review = enc.decode(enc.encode(history_review)[:8000])
@@ -119,7 +95,7 @@ The correct output format: [Sorted Candidate Item List]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run WebSocietySimulator with Chain Of Thought Agent")
-    parser.add_argument('--task_set', default='amazon', choices=['amazon', 'yelp', 'goodreads'])
+    parser.add_argument('--task_set', default='amazon', choices=['amazon', 'yelp', 'goodreads', 'amazon_musical', 'amazon_industrial'])
     parser.add_argument('--scenario', default='classic', choices=['classic', 'user_cold_start', 'item_cold_start'])
     add_llm_args(parser)
     args = parser.parse_args()
@@ -134,11 +110,25 @@ if __name__ == "__main__":
     base_url="http://localhost:8036/v1"
     )
 
-    simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
-    simulator.set_task_and_groundtruth(
-        task_dir=f"../dataset/tasks5/{scenario}/{task_set}/tasks",
-        groundtruth_dir=f"../dataset/tasks5/{scenario}/{task_set}/groundtruth",
-    )
+    if task_set in ["amazon", "yelp", "goodreads"]:
+        simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
+        simulator.set_task_and_groundtruth(
+            task_dir=f"../dataset/tasks5/{scenario}/{task_set}/tasks",
+            groundtruth_dir=f"../dataset/tasks5/{scenario}/{task_set}/groundtruth",
+        )
+    elif task_set == "amazon_musical":
+        simulator = Simulator(data_dir="../dataset/musical_industrial/musical_amazon", device="gpu", cache=True)
+        simulator.set_task_and_groundtruth(
+            task_dir=f"../dataset/tasks5/{scenario}/{task_set}/tasks",
+            groundtruth_dir=f"../dataset/tasks5/{scenario}/{task_set}/groundtruth",
+        )
+    elif task_set == "amazon_industrial":
+        simulator = Simulator(data_dir="../dataset/musical_industrial/industrial_amazon", device="gpu", cache=True)
+        simulator.set_task_and_groundtruth(
+            task_dir=f"../dataset/tasks5/{scenario}/{task_set}/tasks",
+            groundtruth_dir=f"../dataset/tasks5/{scenario}/{task_set}/groundtruth",
+        )
+
     simulator.set_agent(MyRecommendationAgent)
     simulator.set_llm(llm)
 
@@ -146,6 +136,6 @@ if __name__ == "__main__":
     evaluation_results = simulator.evaluate()
 
     os.makedirs(f'./results/{scenario}', exist_ok=True)
-    with open(f'./results/{scenario}/evaluation_results_CoTAgent_{task_set}.json', 'w') as f:
+    with open(f'./results/{scenario}/evaluation_results_CoTAgent_{task_set}_videogame.json', 'w') as f:
         json.dump(evaluation_results, f, indent=4)
     print(f"The evaluation_results for {task_set} is: {evaluation_results}")

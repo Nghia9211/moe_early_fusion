@@ -30,8 +30,8 @@ PYTHON="/home/research/nghialt/.venv/bin/python"
 EMB_DIR="../plugin/simplex/embeddings"
 DATA_DIR="../dataset/output_data_all"
 TASKS_DIR="../dataset/tasks5"
-NUM_TASKS=500
-MAX_WORKERS=20
+NUM_TASKS=None
+MAX_WORKERS=10
 
 run_eval() {
     local TASK_SET=$1

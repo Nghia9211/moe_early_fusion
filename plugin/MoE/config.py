@@ -90,10 +90,11 @@ class MoEConfig:
 
     gating_model_path: str = None
 
-    use_seq:      bool = True
-    use_gcn:      bool = True
-    use_semantic: bool = True
-    use_reranker: bool = True
+    use_seq:        bool = True
+    use_gcn:        bool = True
+    use_semantic:   bool = True
+    use_reranker:   bool = True
+    use_user_agent: bool = True
 
 DEFAULT_CONFIG = MoEConfig()
 

@@ -1,21 +1,49 @@
 """
 moe_fusion/reranker.py
 ───────────────────────
-Feedback Loop 4.0: 
+Feedback Loop 4.0:
   - LLM Reranker được phép chọn lại item cũ nếu nó cho rằng User Simulator sai lầm.
 """
 
 import json
 import re
-import traceback
+import threading
 from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel
 import numpy as np
 import math
 
+from utils.text_processing import (
+    build_review_history,
+    extract_item_text,
+    ITEM_FETCH_KEYS,
+)
+
+# ── Module-level tiktoken cache (tránh load BPE vocab lại mỗi call) ──────────
+try:
+    import tiktoken as _tiktoken
+    _TIKTOKEN_ENC = _tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
+
+# ── Module-level item metadata cache (thread-safe) ───────────────────────────
+_item_cache: Dict[str, dict] = {}
+_item_cache_lock = threading.Lock()
+
+def _cached_get_item(tool, raw_id: str):
+    """Fetch item metadata với cache để tránh gọi lại cùng raw_id nhiều lần."""
+    with _item_cache_lock:
+        if raw_id in _item_cache:
+            return _item_cache[raw_id]
+    result = tool.get_item(item_id=raw_id)
+    with _item_cache_lock:
+        _item_cache[raw_id] = result
+    return result
+
 # ── Structured output schema for LLM reranker ────────────────────────────
+# LLM trả về INDEX (1-based) thay vì tên → tránh hoàn toàn name-mismatch
 class _RankerOutput(BaseModel):
-    ranked_items: List[str]
+    ranked_indices: List[int]   # 1-based indices tương ứng với thứ tự trong ML ranking
     explanation: str
 
 
@@ -23,89 +51,15 @@ def rank_to_score(ranked_list: List[str]) -> Dict[str, float]:
     # Điểm: 1.0, 0.63, 0.5, 0.43, 0.38...
     return {item: 1.0 / math.log2(rank + 2) for rank, item in enumerate(ranked_list)}
 
-def _build_user_query(data: dict, candidate_names: list = None, id2name: Dict[int, str] = None) -> str:
-    """Build user query string, filtering out reviews of candidate items to avoid data leakage.
-    Mirrors the filter in RecHackerAgent_baseline.py line 72:
-        filtered = [r for r in all_reviews if r.get('item_id') not in candidate_ids]
+def _build_user_query(
+    data: dict,
+    candidate_names: list = None,
+    id2name: Dict[int, str] = None,
+) -> str:
+    """Wrapper: build user review history string.
+    Logic chi tiết nằm trong utils/text_processing.py::build_review_history.
     """
-    # Fields to strip from review history (noise / irrelevant metadata)
-    _STRIP_FIELDS = {'date_added', 'date_updated', 'source', 'type',
-                     'timestamp', 'image', 'sub_item_id', 'date',
-                     'review_id', 'user_id'}
-
-    parts = []
-    reviews = data.get('reviews', [])
-    if reviews:
-        # ── FILTER: loại bỏ review của candidate items (tránh leak GT review) ──
-        if isinstance(reviews, list):
-            id2rawid        = data.get('id2rawid', {})
-            interaction_tool = data.get('interaction_tool')
-            candidate_ids = set()
-            for inner_id in data.get('cans', []):
-                raw_id = id2rawid.get(inner_id)
-                if raw_id:
-                    candidate_ids.add(str(raw_id))
-            if candidate_ids:
-                filtered_reviews = []
-                # Build mapping from raw_id -> item_name
-                rawid2name = {}
-                if id2name:
-                    rawid2name = {str(raw): id2name.get(inner)
-                                  for inner, raw in id2rawid.items() if inner in id2name}
-
-                for r in reviews:
-                    item_id_str = str(r.get('item_id', ''))
-                    if item_id_str not in candidate_ids:
-                        # 1. Bỏ các trường noise
-                        r_copy = {k: v for k, v in r.items() if k not in _STRIP_FIELDS}
-
-                        # 2. Thêm item_name (nếu chưa có)
-                        item_name = rawid2name.get(item_id_str)
-                        if item_name:
-                            r_copy['item_name'] = item_name
-
-                        # 3. Inject categories từ interaction_tool (nếu có)
-                        if interaction_tool:
-                            try:
-                                fetched = interaction_tool.get_item(item_id=item_id_str)
-                                if fetched:
-                                    cats = fetched.get('categories')
-                                    if cats:
-                                        if isinstance(cats, list):
-                                            cats = ', '.join(str(c) for c in cats)
-                                        r_copy['categories'] = cats
-                            except Exception:
-                                pass
-
-                        # 4. Đưa item_id và item_name lên đầu dict
-                        ordered = {}
-                        if 'item_id' in r_copy:   ordered['item_id']   = r_copy.pop('item_id')
-                        if 'item_name' in r_copy:  ordered['item_name'] = r_copy.pop('item_name')
-                        if 'categories' in r_copy: ordered['categories'] = r_copy.pop('categories')
-                        ordered.update(r_copy)  # còn lại: stars, text, ...
-
-                        filtered_reviews.append(ordered)
-                reviews = filtered_reviews
-
-        # Convert list → string nếu cần, rồi truncate
-        if isinstance(reviews, list):
-            history_review = str(reviews)
-        else:
-            history_review = reviews
-        try:
-            import tiktoken
-            enc = tiktoken.get_encoding("cl100k_base")
-            encoded = enc.encode(history_review)
-            if len(encoded) > 8000: history_review = enc.decode(encoded[:8000])
-        except Exception:
-            history_review = history_review[:15000]
-        parts.append(f"\n{history_review}")
-    else:
-        seq_str = data.get('seq_str', '') or ''
-        if seq_str and seq_str.strip() and seq_str != 'Empty History':
-            words = seq_str.split()
-            parts.append(f"User history items: {' '.join(words[-80:])}")
-    return "\n\n".join(parts) if parts else ""
+    return build_review_history(data, id2name=id2name)
 
 
 def _embed_similarity(query: str, candidate_names: List[str], candidate_texts: Dict[str, str], embedding_fn) -> Dict[str, float]:
@@ -123,12 +77,20 @@ def _embed_similarity(query: str, candidate_names: List[str], candidate_texts: D
         return {n: 0.5 for n in candidate_names}
 
 def _llm_rerank(
-    llm, data: dict, name2id: Dict[str, int], candidate_names: List[str], 
+    llm, data: dict, name2id: Dict[str, int], candidate_names: List[str],
     user_query: str, memory: List[str], max_candidates: int = 10,
-    output_dir: str = None
+    output_dir: str = None,
+    # ── Token budgets (tổng prompt ≤ ~8k tokens để tránh LengthFinish / Timeout) ──
+    _QUERY_TOKEN_CAP: int = 3000,   # user_query
+    _ITEMS_TOKEN_CAP: int = 4000,   # ranked_display
 ) -> Tuple[List[str], str]:
     cans_to_rank = candidate_names[:max_candidates]
-    dataset = next((d for d in ['yelp', 'amazon', 'goodreads'] if d in str(data)), 'amazon')
+    # Ưu tiên data['dataset'] (inject bởi moe_rec_agent.py), fallback về output_dir path
+    dataset = data.get('dataset') or next(
+        (d for d in ['yelp', 'amazon', 'goodreads']
+         if d in str(data.get('output_dir', ''))),
+        'amazon'
+    )
     task_type = {"goodreads": "Goodreads", "yelp": "Yelp", "amazon": "Amazon"}.get(dataset, "Platform")
     task_item = {"goodreads": "book", "yelp": "business", "amazon": "product"}.get(dataset, "item")
 
@@ -137,49 +99,52 @@ def _llm_rerank(
     item_list_info   = []
 
     if interaction_tool and name2id and id2rawid:
-        keys = ['item_id', 'name', 'stars', 'review_count', 'categories',
-        'title', 'average_rating', 'rating_number', 'description',
-        'ratings_count', 'title_without_series']
         for name in cans_to_rank:
-            inner_id = name2id.get(name)
-            raw_id   = id2rawid.get(inner_id)
+            inner_id  = name2id.get(name)
+            raw_id    = id2rawid.get(inner_id)
             info_dict = {'Target_Name': name}
             if raw_id:
                 try:
-                    fetched = interaction_tool.get_item(item_id=raw_id)
+                    fetched = _cached_get_item(interaction_tool, raw_id)
                     if fetched:
-                        for k in keys:
-                            if k in fetched: info_dict[k] = fetched[k]
-                except Exception: pass
+                        for k in ITEM_FETCH_KEYS:
+                            if k in fetched:
+                                info_dict[k] = fetched[k]
+                except Exception:
+                    pass
             item_list_info.append(info_dict)
     else:
         item_list_info = [{'Target_Name': n} for n in cans_to_rank]
 
     # ── FORMAT ITEMS AS NUMBERED ML RANKING ──────────────────────────────
-    numbered_lines = []
-    for idx, info in enumerate(item_list_info, 1):
-        name = info.get('Target_Name', 'Unknown')
-        details = []
-        for k in ['average_rating', 'stars', 'rating_number', 'ratings_count',
-                   'review_count', 'description', 'categories']:
-            v = info.get(k)
-            if v:
-                if k == 'description' and isinstance(v, str) and len(v) > 150:
-                    v = v[:150] + '...'
-                if k == 'categories' and isinstance(v, str) and len(v) > 100:
-                    v = v[:100] + '...'
-                details.append(f"{k}: {v}")
-        detail_str = ", ".join(details) if details else "No additional info"
-        numbered_lines.append(f'  #{idx}: "{name}" — {detail_str}')
+    numbered_lines = [
+        f'  #{idx}: "{info.get("Target_Name", "Unknown")}" — {extract_item_text(info, dataset)}'
+        for idx, info in enumerate(item_list_info, 1)
+    ]
     ranked_display = "\n".join(numbered_lines)
 
+    # ── Cap ranked_display để tránh prompt quá dài (LengthFinish / Timeout) ──
     try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        encoded_items = enc.encode(ranked_display)
-        if len(encoded_items) > 6000: ranked_display = enc.decode(encoded_items[:6000])
+        if _TIKTOKEN_ENC is not None:
+            encoded_items = _TIKTOKEN_ENC.encode(ranked_display)
+            if len(encoded_items) > _ITEMS_TOKEN_CAP:
+                ranked_display = _TIKTOKEN_ENC.decode(encoded_items[:_ITEMS_TOKEN_CAP])
+        else:
+            ranked_display = ranked_display[:(_ITEMS_TOKEN_CAP * 4)]
     except Exception:
-        ranked_display = ranked_display[:25000]
+        ranked_display = ranked_display[:(_ITEMS_TOKEN_CAP * 4)]
+
+    # ── Cap user_query (đã được build bởi build_review_history, nhưng cap lại ở đây
+    #    để đảm bảo tổng prompt ≤ ~8k tokens ngay cả khi caller truyền query dài) ──
+    try:
+        if _TIKTOKEN_ENC is not None:
+            encoded_q = _TIKTOKEN_ENC.encode(user_query)
+            if len(encoded_q) > _QUERY_TOKEN_CAP:
+                user_query = _TIKTOKEN_ENC.decode(encoded_q[:_QUERY_TOKEN_CAP]) + "\n[... history truncated ...]"
+        else:
+            user_query = user_query[:(_QUERY_TOKEN_CAP * 4)]
+    except Exception:
+        user_query = user_query[:(_QUERY_TOKEN_CAP * 4)]
 
     # ── LLM PROMPT 5.2: UNIFIED FEEDBACK REFINEMENT ─────────────────────────
     if len(memory) > 0:
@@ -210,17 +175,18 @@ Previous Dialogue & User's Critique:
 ML Model's Current Ranking (most recommended first):
 {ranked_display}
 
-INSTRUCTIONS:{positive_items_text}
-1. CRITICAL: Keep POSITIVE MATCHES (items the user explicitly praised) near the TOP. Any item identified as a POSITIVE MATCH in the critique MUST be promoted to Rank 1 or Rank 2. Do NOT move it down.
+REFINEMENT INSTRUCTIONS:{positive_items_text}
+1. CRITICAL: Keep POSITIVE MATCHES (items the user explicitly praised) near the TOP. Any item identified as a POSITIVE MATCH in the critique MUST be promoted to Rank 1 or Rank 2.
 2. Push DOWN items the user explicitly rejected as negative noise or a clear mismatch.
-3. For items not mentioned in the critique: use the user's review history and the item categories/descriptions above to determine the best order.
-4. Output ONLY a JSON: {{"ranked_items": [list of ALL {len(cans_to_rank)} Target_Names in refined order], "explanation": "brief reason"}}
-5. MANDATORY COUNT CHECK: Before outputting, verify that your ranked_items list contains EXACTLY {len(cans_to_rank)} items. If it has fewer, you have made an error — add the missing items at the end. Outputting fewer than {len(cans_to_rank)} items is considered a FAILED response.
-6. Do NOT add text outside the JSON."""
+3. For items not mentioned: use the user's review history and item descriptions to determine the best order.
+4. Output ranked_indices as the item #N numbers from the ML ranking above, ordered from best to worst.
+   Example: if #3 is best, then #1, then #2 → ranked_indices: [3, 1, 2, ...]. Include all {len(cans_to_rank)} indices.
+5. Provide a brief explanation of your changes."""
 
     else:
         prompt = f"""You are a recommendation refinement system for {task_item}s on {task_type}.
 A specialized ML recommendation model has already ranked candidate {task_item}s for this user using multiple signals (sequential behavior patterns, collaborative filtering, and content similarity). Your job is to REFINE this ranking — not rebuild it from scratch.
+The ML ranking is statistically reliable. Make MINIMAL adjustments only when clearly justified.
 
 User's Profile & Review History:
 {user_query}
@@ -229,14 +195,11 @@ ML Model's Ranking (most recommended → least recommended):
 {ranked_display}
 
 REFINEMENT INSTRUCTIONS:
-1. The ML model's ranking is based on strong statistical signals and is generally RELIABLE. Do NOT rearrange dramatically.
-2. Focus on the TOP 5 positions — getting these right matters most.
-3. Only swap two items if you see CLEAR, SPECIFIC evidence in the user's review history that a lower-ranked item better matches their preferences.
-4. Key signals: category/genre alignment, rating patterns, specific features the user mentions in reviews.
-5. When in DOUBT, PRESERVE the ML model's original order.
-6. Output ONLY a JSON: {{"ranked_items": [list of ALL {len(cans_to_rank)} Target_Names in refined order], "explanation": "reason for changes, or 'ML ranking preserved' if no changes needed"}}
-7. MANDATORY COUNT CHECK: Before outputting, verify that your ranked_items list contains EXACTLY {len(cans_to_rank)} items. If it has fewer, you have made an error — add the missing Target_Names at the end in their original order. Outputting fewer than {len(cans_to_rank)} items is considered a FAILED response.
-8. Use Target_Names exactly as shown. Do not introduce new items."""
+1. Only swap items if you see CLEAR, SPECIFIC evidence in the user's review history that a lower-ranked item better matches their preferences.
+2. Key signals: category/genre alignment, rating patterns, specific features the user mentions in reviews.
+3. Output ranked_indices as the item #N numbers from the ML ranking above, ordered from best to worst.
+   Example: if #3 is best, then #1, then #2 → ranked_indices: [3, 1, 2, ...]. Include all {len(cans_to_rank)} indices.
+4. Provide a brief explanation of your changes, or 'ML ranking preserved' if no changes were needed."""
 
     # ── DIALOGUE LOGGING TO FILE (for paper) ──
     import os
@@ -274,90 +237,74 @@ REFINEMENT INSTRUCTIONS:
         SEP2,
     ])
 
-    content = "(no response yet)"   # sentinel for error logging
+    content     = "(no response yet)"   # sentinel for error logging
+    ranked      = list(cans_to_rank)     # fallback: giữ nguyên ML order
+    explanation = "(no explanation)"
     try:
         # ── PRIMARY: with_structured_output (schema-enforced JSON) ────────────
-        # Guarantees valid JSON with correct fields — no parsing needed.
-        # Eliminates Extra data / Invalid \escape / Expecting ',' errors.
-        structured_llm = llm.with_structured_output(_RankerOutput)
-        result         = structured_llm.invoke(prompt)
-        ranked         = result.ranked_items
-        explanation    = result.explanation
+        # LLM trả về ranked_indices (List[int], 1-based) → map về tên gốc.
+        # Loại bỏ hoàn toàn name-mismatch: index không bao giờ sai.
+        #
+        # CRITICAL: bind max_tokens TRƯỚC with_structured_output.
+        # ChatOpenAI.max_tokens KHÔNG được forward tự động qua vLLM's structured-
+        # output endpoint → model sinh vô hạn token → LengthFinishReasonError.
+        # 512 tokens = 10 indices (~30 tok) + explanation (~100 tok) + JSON (~50 tok)
+        # với buffer dư. Đủ dùng, không bao giờ trigger unbounded generation.
+        _MAX_OUTPUT = 512
+        structured_llm  = llm.bind(max_tokens=_MAX_OUTPUT).with_structured_output(_RankerOutput)
+        result          = structured_llm.invoke(prompt)
+        raw_indices     = result.ranked_indices   # e.g. [3, 1, 2, 5, 4, ...]
+        explanation     = result.explanation
+
+        # ── Map index → tên (1-based, clamp ngoài khoảng) ─────────────────
+        n = len(cans_to_rank)
+        seen   = set()
+        ranked = []
+        for idx in raw_indices:
+            if 1 <= idx <= n and idx not in seen:
+                ranked.append(cans_to_rank[idx - 1])
+                seen.add(idx)
+        # Append missing (theo ML order) nếu LLM bỏ sót
+        for i, name in enumerate(cans_to_rank, 1):
+            if i not in seen:
+                ranked.append(name)
+
         # Reconstruct content string for logging consistency
         content = json.dumps(
-            {"ranked_items": ranked, "explanation": explanation},
+            {"ranked_indices": raw_indices, "ranked_items": ranked, "explanation": explanation},
             ensure_ascii=False, indent=2,
         )
 
     except Exception as e_structured:
-        # ── FALLBACK: plain invoke + 3-layer parser ───────────────────────────
-        # Activated if with_structured_output is unavailable or raises.
-        _log_block([f"[RERANKER WARNING] structured_output failed ({type(e_structured).__name__}: {e_structured}), falling back to 3-layer parser"])
-        try:
-            response = llm.invoke(prompt)
-            content  = response.content if hasattr(response, 'content') else str(response)
+        # ── Phân loại lỗi để log rõ hơn ─────────────────────────────────────
+        err_type = type(e_structured).__name__
+        err_msg  = str(e_structured)
 
-            content_clean = content.replace("`" * 3 + "json", "").replace("`" * 3, "").strip()
+        # LengthFinishReasonError: LLM bị cắt vì max_tokens quá nhỏ so với prompt
+        # → nguyên nhân gốc: prompt quá dài; đã được xử lý bằng token cap ở trên.
+        # APITimeoutError: vLLM bị ngộp prompt dài; cũng được giảm thiểu bởi cap.
+        if 'LengthFinishReason' in err_type or 'LengthFinish' in err_msg:
+            warn = (
+                f"[RERANKER WARNING] structured_output failed ({err_type}: {err_msg}), "
+                "keeping ML order  ← Prompt still too long after cap; consider reducing _ITEMS_TOKEN_CAP further."
+            )
+        elif 'Timeout' in err_type or 'timeout' in err_msg.lower():
+            warn = (
+                f"[RERANKER WARNING] structured_output failed ({err_type}: {err_msg}), "
+                "keeping ML order  ← vLLM timeout; prompt may still be too long."
+            )
+        else:
+            warn = f"[RERANKER WARNING] structured_output failed ({err_type}: {err_msg}), keeping ML order"
 
-            # Layer 1: balanced brace extraction (fixes Extra data)
-            def _first_json_object(text):
-                start = text.find('{')
-                if start == -1: return None
-                depth, in_str, esc = 0, False, False
-                for i, ch in enumerate(text[start:], start):
-                    if esc: esc = False; continue
-                    if ch == '\\' and in_str: esc = True; continue
-                    if ch == '"': in_str = not in_str
-                    if not in_str:
-                        if ch == '{': depth += 1
-                        elif ch == '}':
-                            depth -= 1
-                            if depth == 0: return text[start:i + 1]
-                return None
+        _log_block([warn])
 
-            json_str = _first_json_object(content_clean)
-            if not json_str:
-                raise ValueError(f"No JSON object found: {content_clean[:200]}")
-
-            # Layer 2: progressive JSON repairs (fixes Invalid \escape, curly quotes)
-            parsed, last_err = None, None
-            for repair in [
-                lambda s: json.loads(s),
-                lambda s: json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)),
-                lambda s: json.loads(s.replace('\u201c', '"').replace('\u201d', '"')),
-                lambda s: json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\',
-                                            s.replace('\u201c', '"').replace('\u201d', '"'))),
-            ]:
-                try: parsed = repair(json_str); break
-                except Exception as e: last_err = e
-
-            # Layer 3: regex ranked_items extraction (fixes Expecting ',' delimiter)
-            if parsed is None:
-                m = re.search(r'"ranked_items"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
-                if m:
-                    extracted = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
-                    if extracted:
-                        expl_m = re.search(r'"explanation"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
-                        parsed = {'ranked_items': extracted,
-                                  'explanation': expl_m.group(1) if expl_m else '(explanation parse failed)'}
-                if parsed is None:
-                    raise last_err
-
-            ranked      = parsed.get('ranked_items', [])
-            explanation = parsed.get('explanation', '')
-
-        except Exception as e:
-            _log_block([f"[RERANKER ERROR] USER ID {user_id_str} {e}", SEP + "\n"])
-            _log_block([f"[RERANKER ERROR] {content}", SEP + "\n"])
-            return candidate_names, "Failed to parse LLM output."
-
-    # ── Warn if LLM returned fewer items than requested ──────────────────────
-    n_returned = len([r for r in ranked if r in set(cans_to_rank)])
+    # ── Warn nếu LLM trả về index ngoài khoảng hoặc thiếu ───────────────────
+    n_valid = len([r for r in ranked if r in set(cans_to_rank)])
     incomplete_warning = ""
-    if n_returned < len(cans_to_rank):
+    if n_valid < len(cans_to_rank):
         incomplete_warning = (
-            f"[WARNING] LLM returned only {n_returned}/{len(cans_to_rank)} valid items "
-            f"(ignored MANDATORY COUNT CHECK). Missing items will be appended in ML order."
+            f"[WARNING] Index mapping yielded only {n_valid}/{len(cans_to_rank)} valid items. "
+            f"Missing items appended in ML order."
         )
 
     # Write the entire response block atomically in one lock-protected write
@@ -374,17 +321,14 @@ REFINEMENT INSTRUCTIONS:
     log_lines.append(SEP + "\n")
     _log_block(log_lines)
 
-    valid_set    = set(cans_to_rank)
-    ranked_valid = [r for r in ranked if r in valid_set]
-    ranked_set   = set(ranked_valid)
-    for n in cans_to_rank:
-        if n not in ranked_set: ranked_valid.append(n)
-    if len(candidate_names) > max_candidates: ranked_valid += candidate_names[max_candidates:]
+    # ranked đã đầy đủ (append missing đã xử lý trong try block)
+    if len(candidate_names) > max_candidates:
+        ranked += candidate_names[max_candidates:]
 
-    return ranked_valid, explanation
+    return ranked, explanation
 
 class Reranker:
-    def __init__(self, embedding_fn=None, llm=None, mode: str='embed_only', enabled: bool=True, top_llm: int=20, output_dir: str=None):
+    def __init__(self, embedding_fn=None, llm=None, mode: str='embed_only', enabled: bool=True, top_llm: int=10, output_dir: str=None):
         self.embedding_fn, self.llm, self.mode, self.enabled, self.top_llm = embedding_fn, llm, mode, enabled, top_llm
         self.output_dir = output_dir
 
@@ -411,5 +355,5 @@ class Reranker:
         return ranked, rank_to_score(ranked), explanation
 
     @classmethod
-    def from_shared(cls, shared: dict, llm=None, mode: str='embed_only', enabled: bool=True, top_llm: int=20, output_dir: str=None) -> "Reranker":
+    def from_shared(cls, shared: dict, llm=None, mode: str='embed_only', enabled: bool=True, top_llm: int=10, output_dir: str=None) -> "Reranker":
         return cls(embedding_fn=shared.get('embedding_function'), llm=llm, mode=mode, enabled=enabled, top_llm=top_llm, output_dir=output_dir)

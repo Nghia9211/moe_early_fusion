@@ -45,8 +45,8 @@ from config import GatingConfig, DEFAULT_CONFIG
 
 class GatingMLP(nn.Module):
     """
-    MLP gating network.
-    Input : user-context features (dim=5 mặc định)
+    MLP gating network — v2.2.
+    Input : user-context features (dim=7, xem GatingConfig.input_dim)
     Output: softmax gate weights [g_seq, g_gcn, g_sem]
     """
 
@@ -55,7 +55,7 @@ class GatingMLP(nn.Module):
         cfg = cfg or DEFAULT_CONFIG.gating
 
         layers = []
-        in_dim = cfg.input_dim          # phải là 5 trong v2.1
+        in_dim = cfg.input_dim          # 7 context features trong v2.2 (xem GatingConfig)
         for h_dim in cfg.hidden_dims:
             layers += [
                 nn.Linear(in_dim, h_dim),
@@ -282,10 +282,34 @@ class GatingNetwork:
                 dw = self.cfg.default_weights
             return {it: (float(dw[0]), float(dw[1]), float(dw[2])) for it in items}
 
-        # Context-mode đúng: gọi predict_from_context với features đầy đủ
-        # Nếu không có context → fallback default
-        dw = self.cfg.default_weights
-        return {it: (float(dw[0]), float(dw[1]), float(dw[2])) for it in items}
+        # Context-mode: trích xuất context features và gọi predict_from_context
+        def _minmax(d: Dict[str, float]) -> Dict[str, float]:
+            if not d: return {}
+            vals = np.array(list(d.values()))
+            lo, hi = vals.min(), vals.max()
+            if hi == lo: return {k: 0.5 for k in d}
+            return {k: float((v - lo) / (hi - lo)) for k, v in d.items()}
+
+        raw_seq = {it: scores.get('seq', 0.0) for it, scores in signal_scores.items()}
+        raw_gcn = {it: scores.get('gcn', 0.0) for it, scores in signal_scores.items()}
+        raw_sem = {it: scores.get('sem', 0.0) for it, scores in signal_scores.items()}
+
+        norm_seq = _minmax(raw_seq)
+        norm_gcn = _minmax(raw_gcn)
+        norm_sem = _minmax(raw_sem)
+
+        ctx = extract_context_features(
+            seq=[],
+            len_seq=len_seq,
+            seq_scores=norm_seq,
+            gcn_scores=norm_gcn,
+            sem_scores=norm_sem,
+            gcn_norm=None,
+            cfg=self.cfg,
+        )
+
+        g_seq, g_gcn, g_sem = self.predict_from_context(ctx)
+        return {it: (g_seq, g_gcn, g_sem) for it in items}
 
     # ── Save / Load ───────────────────────────────────────────────────────────
 

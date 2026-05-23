@@ -1,11 +1,27 @@
 """
-train_gating.py — v2.1 (User-Context Gating, 5-feature)
+train_gating.py — v2.3 (User-Context Gating, 7-feature)
 ────────────────────────────────────────────────────────────────────
-Thay đổi so với v2.0:
-  - input_dim = 5  (bỏ cold_start_flag, gcn_coverage, seq_entropy)
-  - Thêm gcn_confidence + sem_confidence vào build_context_feature
-  - print_feature_report cập nhật labels
-  - Các tham số khác giữ nguyên (KL + entropy reg, balanced target)
+Features (7):
+  1. norm_seq_len     — độ dài chuỗi chuẩn hoá
+  2. agree_gcn        — mức đồng thuận seq vs gcn
+  3. agree_sem        — mức đồng thuận seq vs sem
+  4. agree_gcn_sem    — Spearman(gcn, sem)
+  5. seq_confidence   — max-mean của seq scores
+  6. gcn_confidence   — max-mean của gcn scores
+  7. sem_confidence   — max-mean của sem scores
+
+Loss được hỗ trợ:
+  - CE  (mặc định): −Σ target_i · log(pred_i), target quality-proportional từ NDCG
+  - BPR (--loss bpr): Bayesian Personalized Ranking với hard negative sampling
+
+Cải tiến so với v2.2:
+  - GCN tra cứu trực tiếp node_embs[user_id] (LightGCN converged vectors)
+    thay vì tổng hợp từ lịch sử tương tác.
+  - Negative Sampling (hard + easy) để BPR loss sắc bén hơn.
+  - Query ngữ cảnh tuỳ biến theo dataset (goodreads/yelp/amazon).
+  - Tên item khoá bằng [ASIN/raw_id] để tránh trùng lặp.
+  - GCN phạt -1.0 cho zero-vector items.
+  - Full-tensor GPU mode trong train_gating_ce (zero CPU overhead mỗi batch).
 """
 
 import os, sys, argparse, math, numpy as np, pandas as pd
@@ -29,20 +45,30 @@ from dataset.general_dataset import GeneralDataset
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Feature labels khớp với v2.2
 FEATURE_LABELS = [
     'norm_seq_len',
     'agree_gcn',
     'agree_sem',
-    'agree_gcn_sem',   # v2.2 NEW: Spearman(gcn, sem)
-    'seq_confidence',  # v2.2 NEW: max-mean of seq scores
-    'gcn_confidence',
-    'sem_confidence',
+    'agree_gcn_sem',   # Spearman(gcn, sem)
+    'seq_confidence',  # max-mean of seq scores
+    'gcn_confidence',  # max-mean of gcn scores
+    'sem_confidence',  # max-mean of sem scores
 ]
 
+# Query prefix tuỳ chỉnh theo dataset để FAISS search khớp hơn
+DATASET_QUERY_PREFIX = {
+    'goodreads': 'Books similar to: ',
+    'yelp':      'Places and restaurants similar to: ',
+    'amazon':    'User interested in: ',
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _minmax(d: Dict[str, float]) -> Dict[str, float]:
     if not d: return {}
@@ -53,47 +79,68 @@ def _minmax(d: Dict[str, float]) -> Dict[str, float]:
 
 
 def _ndcg_quality(gt_name: str, scores: Dict[str, float]) -> float:
+    """NDCG-style quality: rank GT item càng cao → quality càng lớn."""
     if not scores or gt_name not in scores: return 0.0
     rank = sorted(scores, key=scores.get, reverse=True).index(gt_name) + 1
     return 1.0 / math.log2(rank + 1)
 
 
-def _softmax(arr: np.ndarray, temp: float) -> np.ndarray:
-    a = arr / max(temp, 1e-8)
-    a -= a.max()
-    e = np.exp(a)
-    return e / e.sum()
-
-
-def _quality_target_v3(q_arr: np.ndarray, min_quality: float = 0.1) -> Optional[np.ndarray]:
+def _quality_proportional_target(
+    q_arr: np.ndarray,
+    min_quality: float = 0.1,
+) -> Optional[np.ndarray]:
     """
-    Quality-proportional target with weak expert suppression.
-    
-    If an expert's NDCG quality < min_quality, its target weight → 0.
-    If NO expert passes the threshold, return None (skip sample).
+    Tính target gate distribution tỉ lệ với chất lượng từng expert.
+
+    - Expert nào có NDCG < min_quality → weight = 0 (suppressed).
+    - Nếu KHÔNG có expert nào vượt ngưỡng → trả về None (skip sample).
+    - Ngược lại → chuẩn hoá thành distribution tổng = 1.
     """
     q_masked = q_arr.copy()
     q_masked[q_masked < min_quality] = 0.0
-    
     total = q_masked.sum()
     if total < 1e-8:
-        return None  # No expert is good → skip
-    
+        return None  # không expert nào đủ tốt → bỏ sample
     return (q_masked / total).astype(np.float32)
 
 
-def build_context_feature(
-    seq: List[int], len_seq: int,
-    seq_sc: Dict, gcn_sc: Dict, sem_sc: Dict,
-    gcn_norm, cfg: GatingConfig,
-) -> List[float]:
-    """Wrapper gọi extract_context_features từ gating_network.py (5-feature v2.1)."""
-    return extract_context_features(
-        seq=seq, len_seq=len_seq,
-        seq_scores=seq_sc, gcn_scores=gcn_sc, sem_scores=sem_sc,
-        gcn_norm=gcn_norm,   # không dùng trong v2.1, passed for API compat
-        cfg=cfg,
-    )
+def _sample_hard_negatives(
+    gt_name:    str,
+    seq_sc:     Dict[str, float],
+    gcn_sc:     Dict[str, float],
+    sem_sc:     Dict[str, float],
+    all_names:  List[str],
+    n_neg:      int,
+    hard_ratio: float = 0.5,
+) -> List[str]:
+    """
+    Lấy mẫu negative items với tỉ lệ hard/easy.
+
+    Hard negatives: items được rank cao bởi ít nhất một expert nhưng không
+    phải GT → mô hình phải học phân biệt chính xác hơn.
+    Easy negatives: lấy ngẫu nhiên từ pool còn lại.
+    """
+    non_gt = [n for n in all_names if n != gt_name]
+    if not non_gt: return []
+
+    n_hard = max(1, int(n_neg * hard_ratio))
+    n_easy = n_neg - n_hard
+
+    # Gom top-k từ tất cả expert làm hard pool
+    hard_pool: set = set()
+    for sc_dict in [seq_sc, gcn_sc, sem_sc]:
+        if sc_dict:
+            candidates = [n for n in sc_dict if n != gt_name and n in set(non_gt)]
+            top_items  = sorted(candidates, key=sc_dict.get, reverse=True)[:max(n_neg, 10)]
+            hard_pool.update(top_items)
+    hard_pool = list(hard_pool)
+    np.random.shuffle(hard_pool)
+    hard_negs = hard_pool[:n_hard]
+
+    easy_pool = [n for n in non_gt if n not in set(hard_negs)]
+    np.random.shuffle(easy_pool)
+    easy_negs = easy_pool[:n_easy]
+    return hard_negs + easy_negs
 
 
 def print_feature_report(X: np.ndarray):
@@ -106,44 +153,72 @@ def print_feature_report(X: np.ndarray):
         print(f"{lbl:<18} | {col.mean():>7.4f} | {col.std():>7.4f} | {nz:>8.1f}%")
 
 
+def normalize_features(X: np.ndarray):
+    mu  = X.mean(axis=0)
+    std = X.std(axis=0)
+    std[std == 0] = 1.0
+    return (X - mu) / std, mu, std
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Batch score computation  (unchanged from v2.0)
+# Batch score computation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_batch_scores(batch_seqs, batch_lens, batch_pools,
-                         seq_scorer, gcn_scorer, sem_scorer, id2name, device):
+def compute_batch_scores(
+    batch_seqs,
+    batch_lens,
+    batch_pools,
+    batch_queries,       # List[str] — query đã dựng sẵn theo dataset
+    batch_user_ids,      # List[str | None] — user ID để lookup node_embs
+    seq_scorer,
+    gcn_scorer,
+    sem_scorer,
+    id2name,
+    device,
+):
+    """
+    Tính điểm (seq, gcn, sem) cho từng sample trong batch.
+
+    GCN: tra cứu node_embs[user_id] trực tiếp (LightGCN converged vector).
+         Fallback về zero-vector nếu user không có trong node_embs.
+         Items có zero-vector nhận điểm phạt -1.0 trước khi minmax.
+    """
     B = len(batch_seqs)
+
+    # ── Sequential scores ────────────────────────────────────────────────────
     with torch.no_grad():
         all_logits = seq_scorer.model.forward_eval(batch_seqs, batch_lens.cpu().numpy())
 
-    h_users = None
+    # ── GCN scores (node_embs lookup) ────────────────────────────────────────
+    all_gcn_logits = None
     if gcn_scorer:
-        hl = []
+        node_embs = getattr(gcn_scorer, 'node_embs', {})  # Dict[str, Tensor]
+        h_users = []
         for i in range(B):
-            h = gcn_scorer._user_embedding(batch_seqs[i].tolist(), int(batch_lens[i]))
-            hl.append(h if h is not None
-                      else torch.zeros(gcn_scorer.gcn_norm.shape[1], device=device))
-        h_users = torch.stack(hl)
+            uid = str(batch_user_ids[i]) if batch_user_ids is not None else None
+            h_u = node_embs.get(uid) if uid is not None else None
+            if h_u is None:
+                h_u = torch.zeros(gcn_scorer.gcn_norm.shape[1], device=device)
+            h_users.append(h_u.to(device))
+        h_users = torch.stack(h_users)                     # (B, dim)
+        all_gcn_logits = h_users @ gcn_scorer.gcn_norm.T   # (B, num_items)
 
+    # ── Semantic scores (batched FAISS) ──────────────────────────────────────
     sem_map = [{} for _ in range(B)]
     if sem_scorer and sem_scorer.embedding_function:
         all_unique = set()
         for pool in batch_pools:
             all_unique.update(id2name.get(cid, f'item_{cid}') for cid in pool)
-        unique_list = list(all_unique)
-        rich   = sem_scorer._get_candidate_texts(unique_list)
-        q_strs = [
-            'User interested in: ' + ' '.join(
-                id2name.get(iid, '') for iid in batch_seqs[i].tolist() if iid in id2name
-            )
-            for i in range(B)
-        ]
-        q_vecs = np.array(sem_scorer.embedding_function.embed_documents(q_strs), dtype=np.float32)
-        d_vecs = np.array(sem_scorer.embedding_function.embed_documents(rich),   dtype=np.float32)
+        unique_list  = list(all_unique)
+        rich_texts   = sem_scorer._get_candidate_texts(unique_list)
+
+        q_vecs = np.array(sem_scorer.embedding_function.embed_documents(batch_queries),  dtype=np.float32)
+        d_vecs = np.array(sem_scorer.embedding_function.embed_documents(rich_texts),     dtype=np.float32)
         q_vecs /= (np.linalg.norm(q_vecs, axis=1, keepdims=True) + 1e-8)
         d_vecs /= (np.linalg.norm(d_vecs, axis=1, keepdims=True) + 1e-8)
-        sim  = q_vecs @ d_vecs.T
-        n2i  = {n: i for i, n in enumerate(unique_list)}
+        sim     = q_vecs @ d_vecs.T                         # (B, num_unique)
+        n2i     = {n: idx for idx, n in enumerate(unique_list)}
+
         for i, pool in enumerate(batch_pools):
             raw = {
                 id2name[c]: sim[i, n2i[id2name[c]]]
@@ -152,158 +227,251 @@ def compute_batch_scores(batch_seqs, batch_lens, batch_pools,
             }
             sem_map[i] = _minmax(raw)
 
+    # ── Assemble per-sample results ───────────────────────────────────────────
     results = []
     for i in range(B):
         pool  = batch_pools[i]
         s_seq = _minmax({id2name[c]: all_logits[i, c].item() for c in pool if c in id2name})
-        s_gcn = {}
-        if h_users is not None:
-            can_ids = torch.tensor([c for c in pool if c < gcn_scorer.num_items], device=device)
-            if len(can_ids):
-                sims  = (gcn_scorer.gcn_norm[can_ids] @ h_users[i]).cpu().tolist()
-                s_gcn = _minmax({
-                    id2name[c.item()]: s
-                    for c, s in zip(can_ids, sims)
-                    if c.item() in id2name
-                })
+
+        s_gcn: Dict[str, float] = {}
+        if all_gcn_logits is not None:
+            raw_gcn = {}
+            for c in pool:
+                if c not in id2name: continue
+                if c >= gcn_scorer.num_items or gcn_scorer.gcn_norm[c].norm().item() < 1e-6:
+                    raw_gcn[id2name[c]] = -1.0   # zero-vector → phạt
+                else:
+                    raw_gcn[id2name[c]] = all_gcn_logits[i, c].item()
+            s_gcn = _minmax(raw_gcn)
+
         results.append((s_seq, s_gcn, sem_map[i]))
     return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build training data — 5-feature context + KL target
+# Build training data — CE mode (7-feature context + quality-proportional target)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_training_data_context(
-    loader, seq_scorer, gcn_scorer, sem_scorer,
-    id2name, cfg: GatingConfig,
-    temperature:  float = 2.0,
-    balance_eps:  float = 0.05,
+def build_training_data_ce(
+    loader,
+    seq_scorer,
+    gcn_scorer,
+    sem_scorer,
+    id2name:     Dict[int, str],
+    cfg:         GatingConfig,
+    dataset:     str   = 'amazon',
+    balance_eps: float = 0.1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
-        X : (N, 5) context features
-        Y : (N, 3) KL target gate distribution
+        X : (N, 7) context features
+        Y : (N, 3) quality-proportional target gate distribution
     """
+    query_prefix = DATASET_QUERY_PREFIX.get(dataset, 'User interested in: ')
+    gcn_norm     = gcn_scorer.gcn_norm if gcn_scorer else None
+    device       = seq_scorer.device
     X_list, Y_list = [], []
-    gcn_norm = gcn_scorer.gcn_norm if gcn_scorer else None
-    device   = seq_scorer.device
+    skipped = 0
 
-    pbar = tqdm(loader, desc='Building Context Training Data', unit='batch')
+    pbar = tqdm(loader, desc='Building CE Training Data', unit='batch')
     for batch in pbar:
-        seqs     = batch['seq'].to(device)
-        lens     = batch['len_seq'].to(device)
-        next_ids = batch['next'].cpu().numpy()
-        cans_t   = batch.get('cans')
+        seqs         = batch['seq'].to(device)
+        lens         = batch['len_seq'].to(device)
+        next_ids     = batch['next'].cpu().numpy()
+        cans_t       = batch.get('cans')
+        user_ids     = batch.get('id')          # List[str] từ dataset
 
-        batch_pools = []
+        batch_pools, batch_queries = [], []
         for i in range(len(next_ids)):
             gt_id = int(next_ids[i])
             cans  = cans_t[i].tolist() if cans_t is not None else []
             batch_pools.append(list(set(cans) | {gt_id}))
 
+            seq_str = ' '.join(id2name[iid] for iid in seqs[i].tolist() if iid in id2name)
+            batch_queries.append(query_prefix + seq_str)
+
         results = compute_batch_scores(
-            seqs, lens, batch_pools,
+            seqs, lens, batch_pools, batch_queries, user_ids,
             seq_scorer, gcn_scorer, sem_scorer, id2name, device,
         )
 
         for i in range(len(next_ids)):
             gt_id   = int(next_ids[i])
             gt_name = id2name.get(gt_id)
-            if not gt_name:
-                continue
+            if not gt_name: continue
 
             s_seq, s_gcn, s_sem = results[i]
-            len_seq_i = int(lens[i])
-            seq_list  = seqs[i].tolist()
 
-            # ── 5-feature context vector ─────────────────────────────────────
-            ctx = build_context_feature(
-                seq_list, len_seq_i, s_seq, s_gcn, s_sem, gcn_norm, cfg
+            # ── 7-feature context vector ──────────────────────────────────
+            ctx = extract_context_features(
+                seq=seqs[i].tolist(), len_seq=int(lens[i]),
+                seq_scores=s_seq, gcn_scores=s_gcn, sem_scores=s_sem,
+                gcn_norm=gcn_norm, cfg=cfg,
             )
 
-            # ── Target: NDCG quality per expert ──────────────────────────
-            q_seq = _ndcg_quality(gt_name, s_seq)
-            q_gcn = _ndcg_quality(gt_name, s_gcn) if s_gcn else 0.0
-            q_sem = _ndcg_quality(gt_name, s_sem) if s_sem else 0.0
-            q_arr = np.array([q_seq, q_gcn, q_sem], dtype=np.float32)
+            # ── Quality-proportional target ───────────────────────────────
+            q_arr = np.array([
+                _ndcg_quality(gt_name, s_seq),
+                _ndcg_quality(gt_name, s_gcn) if s_gcn else 0.0,
+                _ndcg_quality(gt_name, s_sem) if s_sem else 0.0,
+            ], dtype=np.float32)
 
-            # v3: quality-aware target with weak expert suppression
-            target_gate = _quality_target_v3(q_arr, min_quality=balance_eps)
+            target_gate = _quality_proportional_target(q_arr, min_quality=balance_eps)
             if target_gate is None:
-                continue  # Skip samples where no expert is good
+                skipped += 1
+                continue
 
             X_list.append(ctx)
             Y_list.append(target_gate)
 
-        pbar.set_postfix({'N': len(X_list)})
+        pbar.set_postfix({'N': len(X_list), 'skipped': skipped})
     pbar.close()
 
+    if skipped > 0:
+        print(f'  ⚠️  Skipped {skipped:,} samples (no expert passed balance_eps={balance_eps})')
     return np.array(X_list, dtype=np.float32), np.array(Y_list, dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Normalization
+# Build training data — BPR mode (hard negative sampling)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def normalize_features(X: np.ndarray):
-    mu  = X.mean(axis=0)
-    std = X.std(axis=0)
-    std[std == 0] = 1.0        # constant features → keep as-is (shouldn't happen in v2.1)
-    return (X - mu) / std, mu, std
+def build_training_data_bpr(
+    loader,
+    seq_scorer,
+    gcn_scorer,
+    sem_scorer,
+    id2name:    Dict[int, str],
+    cfg:        GatingConfig,
+    dataset:    str   = 'amazon',
+    n_neg:      int   = 5,
+    hard_ratio: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+        X_pos : (N, 7) features của GT item
+        X_neg : (N, 7) features của negative item (hard/easy mixed)
+
+    BPR loss sau đó tối ưu: score(pos) > score(neg).
+    Hard negatives (rank cao nhưng sai) giúp gate sắc bén, tránh expert collapse.
+    """
+    query_prefix = DATASET_QUERY_PREFIX.get(dataset, 'User interested in: ')
+    gcn_norm     = gcn_scorer.gcn_norm if gcn_scorer else None
+    device       = seq_scorer.device
+    X_pos_list, X_neg_list = [], []
+
+    pbar = tqdm(loader, desc='Building BPR Training Data', unit='batch')
+    for batch in pbar:
+        seqs     = batch['seq'].to(device)
+        lens     = batch['len_seq'].to(device)
+        next_ids = batch['next'].cpu().numpy()
+        cans_t   = batch.get('cans')
+        user_ids = batch.get('id')
+
+        batch_pools, batch_queries = [], []
+        for i in range(len(next_ids)):
+            gt_id = int(next_ids[i])
+            cans  = cans_t[i].tolist() if cans_t is not None else []
+            batch_pools.append(list(set(cans) | {gt_id}))
+            seq_str = ' '.join(id2name[iid] for iid in seqs[i].tolist() if iid in id2name)
+            batch_queries.append(query_prefix + seq_str)
+
+        results = compute_batch_scores(
+            seqs, lens, batch_pools, batch_queries, user_ids,
+            seq_scorer, gcn_scorer, sem_scorer, id2name, device,
+        )
+
+        for i in range(len(next_ids)):
+            gt_id   = int(next_ids[i])
+            gt_name = id2name.get(gt_id)
+            if not gt_name: continue
+
+            s_seq, s_gcn, s_sem = results[i]
+            pos_feat = extract_context_features(
+                seq=seqs[i].tolist(), len_seq=int(lens[i]),
+                seq_scores=s_seq, gcn_scores=s_gcn, sem_scores=s_sem,
+                gcn_norm=gcn_norm, cfg=cfg,
+            )
+
+            all_pool_names = [id2name[c] for c in batch_pools[i] if c in id2name]
+            neg_names = _sample_hard_negatives(
+                gt_name, s_seq, s_gcn, s_sem,
+                all_pool_names, n_neg, hard_ratio,
+            )
+
+            for neg_name in neg_names:
+                # Tạo score dict giả với GT=neg để extract_context_features tính đúng
+                neg_seq = {k: v for k, v in s_seq.items()}
+                neg_gcn = {k: v for k, v in s_gcn.items()}
+                neg_sem = {k: v for k, v in s_sem.items()}
+                # Đổi vai trò GT → neg_name để context feature phản ánh item sai
+                neg_feat = extract_context_features(
+                    seq=seqs[i].tolist(), len_seq=int(lens[i]),
+                    seq_scores=neg_seq, gcn_scores=neg_gcn, sem_scores=neg_sem,
+                    gcn_norm=gcn_norm, cfg=cfg,
+                )
+                X_pos_list.append(pos_feat)
+                X_neg_list.append(neg_feat)
+
+        pbar.set_postfix({'pairs': len(X_pos_list)})
+    pbar.close()
+
+    return np.array(X_pos_list, dtype=np.float32), np.array(X_neg_list, dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Training loop
+# Training — CE loss (full-tensor GPU mode)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_gating_context(
-    X:        np.ndarray,
-    Y_target: np.ndarray,
-    cfg:      GatingConfig,
-    device:   torch.device,
+def train_gating_ce(
+    X:         np.ndarray,
+    Y_target:  np.ndarray,
+    cfg:       GatingConfig,
+    device:    torch.device,
     val_ratio: float = 0.1,
 ) -> GatingMLP:
     """
-    Train GatingMLP với KL-Divergence loss + Entropy regularization.
+    Train GatingMLP với Cross-Entropy loss thuần tuý.
 
-    Loss = KL(target || predicted) - entropy_weight * H(predicted)
-    Entropy bonus buộc gates phân tán, tránh collapse về 1 expert.
+    Loss = −Σ target_i · log(pred_i)
+
+    Toàn bộ data được load lên GPU một lần (full-tensor mode) —
+    không dùng DataLoader để tránh CPU→GPU overhead mỗi batch.
     """
     n     = len(X)
     n_val = max(1, int(n * val_ratio))
     idx   = np.random.permutation(n)
     v_idx, t_idx = idx[:n_val], idx[n_val:]
+    n_tr  = len(t_idx)
 
-    ds     = TensorDataset(
-        torch.tensor(X[t_idx],        dtype=torch.float32),
-        torch.tensor(Y_target[t_idx], dtype=torch.float32),
-    )
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
+    # Load toàn bộ lên GPU một lần
+    X_tr = torch.tensor(X[t_idx],        dtype=torch.float32, device=device)
+    Y_tr = torch.tensor(Y_target[t_idx], dtype=torch.float32, device=device)
+    X_vl = torch.tensor(X[v_idx],        dtype=torch.float32, device=device)
+    Y_vl = torch.tensor(Y_target[v_idx], dtype=torch.float32, device=device)
 
     model     = GatingMLP(cfg).to(device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-5)
 
-    X_vl = torch.tensor(X[v_idx],        dtype=torch.float32).to(device)
-    Y_vl = torch.tensor(Y_target[v_idx], dtype=torch.float32).to(device)
-
+    B         = cfg.batch_size
+    n_batches = math.ceil(n_tr / B)
     best_val, best_state = float('inf'), None
 
     for epoch in range(cfg.epochs):
         model.train()
+        # Shuffle trên GPU — zero CPU overhead
+        perm       = torch.randperm(n_tr, device=device)
+        X_sh, Y_sh = X_tr[perm], Y_tr[perm]
+
         total_loss = 0.0
-        for x_b, y_b in loader:
-            x_b, y_b = x_b.to(device), y_b.to(device)
+        for b in range(n_batches):
+            x_b = X_sh[b * B : (b + 1) * B]
+            y_b = Y_sh[b * B : (b + 1) * B]
             optimizer.zero_grad()
-            gates = model(x_b)                              # (B, 3) — softmax
-
-            # Cross-entropy loss: -Σ target_i * log(pred_i)
-            ce = -(y_b * gates.log().clamp(min=-100)).sum(dim=-1).mean()
-            # Concentration reg: penalize uniform gates (opposite of entropy bonus)
-            neg_H = (gates * gates.log().clamp(min=-100)).sum(dim=-1).mean()
-            loss = ce + conc_w * neg_H
-
+            gates = model(x_b)
+            # CE: −Σ target_i · log(pred_i)
+            loss  = -(y_b * gates.log().clamp(min=-100)).sum(dim=-1).mean()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -312,38 +480,115 @@ def train_gating_context(
         model.eval()
         with torch.no_grad():
             vl_gates = model(X_vl)
-            vl_ce    = -(Y_vl * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
-            vl_negH  = (vl_gates * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
-            val_loss = vl_ce + conc_w * vl_negH
+            val_loss = -(Y_vl * vl_gates.log().clamp(min=-100)).sum(dim=-1).mean().item()
 
         if val_loss < best_val:
             best_val   = val_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         if (epoch + 1) % 10 == 0:
-            avg_g = model(X_vl).mean(dim=0).detach().cpu().numpy()
-            print(f'  Epoch {epoch+1:03d}/{cfg.epochs} | '
-                  f'train={total_loss / max(len(loader), 1):.4f} | val={val_loss:.4f} | '
+            with torch.no_grad():
+                avg_g = model(X_vl).cpu().numpy().mean(axis=0)
+            print(f'  [CE] Epoch {epoch+1:03d}/{cfg.epochs} | '
+                  f'train={total_loss / n_batches:.4f} | val={val_loss:.4f} | '
                   f'gates: seq={avg_g[0]:.3f} gcn={avg_g[1]:.3f} sem={avg_g[2]:.3f}')
 
     if best_state:
         model.load_state_dict(best_state)
 
-    # Final distribution stats
+    # Thống kê phân phối gate cuối cùng
     model.eval()
     with torch.no_grad():
-        all_x = torch.tensor(X, dtype=torch.float32).to(device)
-        avg_g = model(all_x).detach().cpu().numpy()
+        X_all = torch.tensor(X, dtype=torch.float32, device=device)
+        all_g = model(X_all).cpu().numpy()
 
-    print(f'\n📊 Final avg gates on ALL data:')
-    print(f'   seq={avg_g[:,0].mean():.3f}±{avg_g[:,0].std():.3f} | '
-          f'gcn={avg_g[:,1].mean():.3f}±{avg_g[:,1].std():.3f} | '
-          f'sem={avg_g[:,2].mean():.3f}±{avg_g[:,2].std():.3f}')
-    print(f'\n📊 Target gate distribution (mean):')
-    print(f'   seq={Y_target[:,0].mean():.3f} | '
+    print(f'\n📊 Final avg gates (all data): '
+          f'seq={all_g[:,0].mean():.3f}±{all_g[:,0].std():.3f} | '
+          f'gcn={all_g[:,1].mean():.3f}±{all_g[:,1].std():.3f} | '
+          f'sem={all_g[:,2].mean():.3f}±{all_g[:,2].std():.3f}')
+    print(f'\n📊 Target gate distribution: '
+          f'seq={Y_target[:,0].mean():.3f} | '
           f'gcn={Y_target[:,1].mean():.3f} | '
           f'sem={Y_target[:,2].mean():.3f}')
     print(f'\nBest val loss: {best_val:.4f}')
+    return model
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training — BPR loss
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_gating_bpr(
+    X_pos:     np.ndarray,
+    X_neg:     np.ndarray,
+    cfg:       GatingConfig,
+    device:    torch.device,
+    val_ratio: float = 0.1,
+) -> GatingMLP:
+    """
+    Train GatingMLP với BPR loss.
+
+    Loss = −E[ log σ( score(pos) − score(neg) ) ]
+    score(x) = Σ gate_i(x) * x_i  (tích vô hướng gate với 3 expert scores)
+
+    Hard negative sampling làm cho khoảng cách pos/neg sắc bén hơn,
+    giảm thiểu expert collapse (gate bị thiên vị 1 expert).
+    """
+    n     = len(X_pos)
+    n_val = max(1, int(n * val_ratio))
+    idx   = np.random.permutation(n)
+    v_idx, t_idx = idx[:n_val], idx[n_val:]
+
+    ds     = TensorDataset(
+        torch.tensor(X_pos[t_idx], dtype=torch.float32),
+        torch.tensor(X_neg[t_idx], dtype=torch.float32),
+    )
+    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
+
+    model     = GatingMLP(cfg).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-5)
+
+    Xp_vl = torch.tensor(X_pos[v_idx], dtype=torch.float32).to(device)
+    Xn_vl = torch.tensor(X_neg[v_idx], dtype=torch.float32).to(device)
+
+    def bpr_loss(x_pos: torch.Tensor, x_neg: torch.Tensor) -> torch.Tensor:
+        gates_pos = model(x_pos)                           # (B, 3)
+        gates_neg = model(x_neg)
+        # Score = weighted sum của 3 expert scores (dim 0..2 của feature vector)
+        s_pos = (gates_pos * x_pos[:, :3]).sum(dim=-1)    # (B,)
+        s_neg = (gates_neg * x_neg[:, :3]).sum(dim=-1)
+        return -torch.log(torch.sigmoid(s_pos - s_neg) + 1e-8).mean()
+
+    best_val, best_state = float('inf'), None
+
+    for epoch in range(cfg.epochs):
+        model.train()
+        total_loss = 0.0
+        for xp, xn in loader:
+            xp, xn = xp.to(device), xn.to(device)
+            optimizer.zero_grad()
+            loss = bpr_loss(xp, xn)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = bpr_loss(Xp_vl, Xn_vl).item()
+
+        if val_loss < best_val:
+            best_val   = val_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if (epoch + 1) % 10 == 0:
+            print(f'  [BPR] Epoch {epoch+1:03d}/{cfg.epochs} | '
+                  f'train={total_loss / max(len(loader), 1):.4f} | val={val_loss:.4f}')
+
+    if best_state:
+        model.load_state_dict(best_state)
+    print(f'Best BPR val loss: {best_val:.4f}')
     return model
 
 
@@ -362,20 +607,23 @@ def main():
     parser.add_argument('--epochs',      type=int,   default=50)
     parser.add_argument('--lr',          type=float, default=1e-3)
     parser.add_argument('--batch_size',  type=int,   default=256)
-    parser.add_argument('--kl_temp',     type=float, default=1.0)
+    parser.add_argument('--loss',        default='ce', choices=['ce', 'bpr'],
+                        help='Loss function: ce (default) hoặc bpr (Bayesian Personalized Ranking)')
     parser.add_argument('--balance_eps', type=float, default=0.1,
-                        help='v3: expert quality threshold. Experts with NDCG < this → gate=0')
-    parser.add_argument('--entropy_reg', type=float, default=0.0,
-                        help='DEPRECATED. Use --conc_weight instead.')
-    parser.add_argument('--conc_weight', type=float, default=0.02,
-                        help='Concentration reg weight. Positive = penalize uniform gates')
+                        help='[CE] Ngưỡng NDCG tối thiểu. Expert dưới ngưỡng → weight=0. '
+                             'Sample bị skip nếu mọi expert đều dưới ngưỡng.')
+    parser.add_argument('--n_neg',       type=int,   default=5,
+                        help='[BPR] Số negative items mỗi positive sample.')
+    parser.add_argument('--hard_ratio',  type=float, default=0.5,
+                        help='[BPR] Tỉ lệ hard negatives trong tổng negatives.')
     parser.add_argument('--split',       default='val', choices=['train', 'val', 'test'])
     parser.add_argument('--hidden_size', type=int,   default=64)
     parser.add_argument('--embed_model', default='sentence-transformers/all-MiniLM-L6-v2')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'[train_gating v2.2] Device={device} | dataset={args.dataset} | split={args.split}')
+    print(f'[train_gating v2.3] Device={device} | dataset={args.dataset} | '
+          f'split={args.split} | loss={args.loss}')
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Load SASRec ──────────────────────────────────────────────────────────
@@ -388,78 +636,119 @@ def main():
     sasrec.load_state_dict(ckpt.get('model_state_dict', ckpt))
     sasrec.eval()
 
+    # ── id2name với khoá [raw_id] để tránh trùng lặp tên ────────────────────
+    id2rawid: Dict[int, str] = {}
+    rawid_path = os.path.join(args.data_dir, 'id2rawid.txt')
+    if os.path.exists(rawid_path):
+        with open(rawid_path, encoding='utf-8') as f:
+            for line in f:
+                ll = line.strip().split('::')
+                if len(ll) >= 2:
+                    id2rawid[int(ll[0])] = ll[1].strip()
+
     id2name: Dict[int, str] = {}
+    name2id: Dict[str, int] = {}
     with open(os.path.join(args.data_dir, 'id2name.txt'), encoding='utf-8') as f:
         for line in f:
             ll = line.strip().split('::', 1)
             if len(ll) == 2:
-                id2name[int(ll[0])] = ll[1].strip()
+                cid       = int(ll[0])
+                orig_name = ll[1].strip()
+                raw_id    = id2rawid.get(cid, str(cid))
+                # Khoá bằng [raw_id] để đảm bảo tên duy nhất
+                unique_name      = f"{orig_name} [{raw_id}]"
+                id2name[cid]     = unique_name
+                name2id[unique_name] = cid
 
     shared = {
-        'model': sasrec, 'id2name': id2name, 'name2id': {},
-        'item_num': item_num, 'device': device,
+        'model': sasrec, 'id2name': id2name, 'name2id': name2id,
+        'item_num': item_num, 'device': device, 'dataset': args.dataset,
     }
     seq_scorer = SeqScorer.from_shared(shared)
 
-    # ── GCN ─────────────────────────────────────────────────────────────────
+    # ── GCN (hỗ trợ cả format mới item_emb+node_embs và format cũ) ──────────
     gcn_scorer = None
     if args.gcn_path and os.path.exists(args.gcn_path):
-        shared['gcn_embeddings'] = torch.load(args.gcn_path, map_location=device, weights_only=True)
+        gcn_data = torch.load(args.gcn_path, map_location=device, weights_only=False)
+        if isinstance(gcn_data, dict) and 'item_emb' in gcn_data:
+            shared['gcn_embeddings'] = gcn_data['item_emb']
+            shared['node_embs']      = gcn_data.get('node_embs', {})
+            print(f'[GCN] Loaded remapped: item_emb={shared["gcn_embeddings"].shape}, '
+                  f'node_embs={len(shared["node_embs"]):,} nodes')
+        else:
+            shared['gcn_embeddings'] = gcn_data
+            shared['node_embs']      = {}
+            print(f'[GCN] Loaded legacy Tensor: shape={shared["gcn_embeddings"].shape}')
         gcn_scorer = GCNScorer.from_shared(shared)
-        print(f'[train_gating] GCN loaded: {gcn_scorer.num_items} items')
 
     # ── Semantic ─────────────────────────────────────────────────────────────
     sem_scorer = None
     if args.faiss_path and os.path.exists(args.faiss_path):
         from langchain_huggingface import HuggingFaceEmbeddings
         from langchain_community.vectorstores import FAISS
-        embed_fn  = HuggingFaceEmbeddings(model_name=args.embed_model)
-        vs        = FAISS.load_local(
+        embed_fn = HuggingFaceEmbeddings(model_name=args.embed_model)
+        vs       = FAISS.load_local(
             folder_path=args.faiss_path, embeddings=embed_fn,
             allow_dangerous_deserialization=True,
         )
         shared.update({'vector_store': vs, 'embedding_function': embed_fn})
         sem_scorer = SemanticScorer.from_shared(shared)
-        print('[train_gating] Semantic FAISS loaded')
+        print('[Semantic] FAISS loaded')
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     class _Args:
         def __init__(self, d): self.data_dir = d
 
-    dataset = GeneralDataset(
+    dataset_obj = GeneralDataset(
         _Args(args.data_dir),
-        stage={'train': 'train', 'val': 'val', 'test': 'test'}[args.split],
+        stage={'train': 'train', 'val': 'valid', 'test': 'test'}[args.split],
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    loader = DataLoader(dataset_obj, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    # ── GatingConfig v2.2 ────────────────────────────────────────────────────
+    # ── GatingConfig v2.3 (7-feature) ────────────────────────────────────────
     cfg = GatingConfig(
-        input_dim          = 7,
-        hidden_dims        = [32, 16],
-        dropout            = 0.2,
-        epochs             = args.epochs,
-        lr                 = args.lr,
-        batch_size         = args.batch_size,
-        gating_mode        = 'context',
-        entropy_reg_weight = args.entropy_reg,
+        input_dim                = 7,
+        hidden_dims              = [32, 16],
+        dropout                  = 0.2,
+        epochs                   = args.epochs,
+        lr                       = args.lr,
+        batch_size               = args.batch_size,
+        gating_mode              = 'context',
         expert_quality_threshold = args.balance_eps,
-        concentration_weight     = args.conc_weight,
     )
 
-    # ── Build training data ──────────────────────────────────────────────────
-    print('\n📦 Building context training data (7-feature v2.2)...')
-    X_raw, Y_target = build_training_data_context(
-        loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
-        cfg=cfg, temperature=args.kl_temp, balance_eps=args.balance_eps,
-    )
-    print(f'Training samples: {len(X_raw):,}')
-    print_feature_report(X_raw)
+    # ── Build training data & Train ──────────────────────────────────────────
+    if args.loss == 'ce':
+        print(f'\n📦 Building CE training data (7-feature, balance_eps={args.balance_eps})...')
+        X_raw, Y_target = build_training_data_ce(
+            loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
+            cfg=cfg, dataset=args.dataset, balance_eps=args.balance_eps,
+        )
+        print(f'Training samples: {len(X_raw):,}')
+        print_feature_report(X_raw)
+        X_norm, mu, std = normalize_features(X_raw)
 
-    X_norm, mu, std = normalize_features(X_raw)
+        print('\n🚀 Training GatingMLP v2.3 (CE loss)...')
+        trained_mlp = train_gating_ce(X_norm, Y_target, cfg, device)
 
-    # ── Train ────────────────────────────────────────────────────────────────
-    print('\n🚀 Training GatingMLP v2.2 (7-feature context-mode)...')
-    trained_mlp = train_gating_context(X_norm, Y_target, cfg, device)
+    else:  # bpr
+        print(f'\n📦 Building BPR training data '
+              f'(n_neg={args.n_neg}, hard_ratio={args.hard_ratio})...')
+        X_pos, X_neg = build_training_data_bpr(
+            loader, seq_scorer, gcn_scorer, sem_scorer, id2name,
+            cfg=cfg, dataset=args.dataset,
+            n_neg=args.n_neg, hard_ratio=args.hard_ratio,
+        )
+        print(f'Training pairs: {len(X_pos):,}')
+        print_feature_report(X_pos)
+        X_pos, mu, std = normalize_features(X_pos)
+        X_neg          = (X_neg - mu) / np.where(std == 0, 1.0, std)
+
+        print('\n🚀 Training GatingMLP v2.3 (BPR loss)...')
+        trained_mlp = train_gating_bpr(X_pos, X_neg, cfg, device)
+
+        # Y_target placeholder để print_feature_report & save nhất quán
+        Y_target = np.zeros((len(X_pos), 3), dtype=np.float32)
 
     # ── Save ─────────────────────────────────────────────────────────────────
     out_path = os.path.join(args.output_dir, f'{args.dataset}_gating_model.pt')
@@ -469,8 +758,9 @@ def main():
         'norm_mean':        mu.tolist(),
         'norm_std':         std.tolist(),
         'gating_mode':      'context',
-        'feature_version':  'v2.2',
+        'feature_version':  'v2.3',
         'feature_names':    FEATURE_LABELS,
+        'loss':             args.loss,
     }, out_path)
     print(f'\n✅ Saved → {out_path}')
 

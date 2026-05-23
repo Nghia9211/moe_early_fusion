@@ -180,11 +180,12 @@ class ScoreCombiner:
         top_k:         int = None,
         epoch:         int = 1,
     ) -> Tuple[List[str], Dict[str, float], dict]:
-        dataset = next(
-            (d for d in ['yelp', 'amazon', 'goodreads']
-             if d in getattr(args, 'data_dir', '')),
-            'amazon'
-        )
+        # Ưu tiên data['dataset'] (inject bởi moe_rec_agent.py) để nhất quán
+        # với reranker.py. Fallback về args.data_dir nếu chưa có.
+        dataset = (data.get('dataset') or
+                   next((d for d in ['yelp', 'amazon', 'goodreads']
+                         if d in getattr(args, 'data_dir', '')),
+                        'amazon'))
         len_seq = data.get('len_seq', 0)
         top_k   = top_k or DEFAULT_CONFIG.retrieval.top_K
 

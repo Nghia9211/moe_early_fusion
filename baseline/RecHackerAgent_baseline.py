@@ -124,18 +124,30 @@ if __name__ == "__main__":
     base_url="http://localhost:11435/v1"
     )
 
-    simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
+    # simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
+    # simulator.set_task_and_groundtruth(
+    #     task_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/tasks",
+    #     groundtruth_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/groundtruth",
+    # )
+
+    # simulator = Simulator(data_dir="../musical_industrial/industrial_amazon", device="gpu", cache=True)
+    # simulator.set_task_and_groundtruth(
+    #     task_dir=f"../musical_industrial/industrial_amazon/task5_industrial_amazon/{scenario}/amazon_industrial/tasks",
+    #     groundtruth_dir=f"../musical_industrial/industrial_amazon/task5_industrial_amazon/{scenario}/amazon_industrial/groundtruth",
+    # )
+
+    simulator = Simulator(data_dir="../dataset/musical_industrial/musical_amazon", device="gpu", cache=True)
     simulator.set_task_and_groundtruth(
-        task_dir=f"../dataset/tasks5/{scenario}/{task_set}/tasks",
-        groundtruth_dir=f"../dataset/tasks5/{scenario}/{task_set}/groundtruth",
+        task_dir=f"../dataset/tasks5/{scenario}/amazon_musical/tasks",
+        groundtruth_dir=f"../dataset/tasks5/{scenario}/amazon_musical/groundtruth",
     )
     simulator.set_agent(MyRecommendationAgent)
     simulator.set_llm(llm)
 
-    agent_outputs      = simulator.run_simulation(number_of_tasks=None, enable_threading=True, max_workers=10)
+    agent_outputs      = simulator.run_simulation(number_of_tasks=None, enable_threading=True, max_workers=16)
     evaluation_results = simulator.evaluate()
 
     os.makedirs(f'./results/{scenario}', exist_ok=True)
-    with open(f'./results/{scenario}/evaluation_results_RecHacker_{task_set}_final.json', 'w') as f:
+    with open(f'./results/{scenario}/evaluation_results_RecHacker_{task_set}_musical_amazon.json', 'w') as f:
         json.dump(evaluation_results, f, indent=4)
     print(f"The evaluation_results for {task_set} is: {evaluation_results}")
