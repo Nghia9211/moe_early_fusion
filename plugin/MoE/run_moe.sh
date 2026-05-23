@@ -10,24 +10,32 @@ work_dir="."
 cd "$work_dir"
 
 # ── Dataset List & Scenario ───────────────────────────────────────────────
-# DATASETS=( "yelp" "amazon")
-# DATASETS=( "goodreads" "yelp")
-DATASETS=("amazon")
+DATASETS=( "yelp" "amazon")
+# DATASETS=( "goodreads" "amazon")
+# DATASETS=("goodreads")
 # DATASETS=("goodreads" "yelp" "amazon")
-
+# DATASETS=("amazon_musical" "amazon_industrial")
 # Đổi SCENARIO thành mảng để loop
-# SCENARIOS=("user_cold_start" "classic")
-SCENARIOS=("classic")
+SCENARIOS=("user_cold_start" "classic")
+# SCENARIOS=("user_cold_start" )
 
 # ── Global Configs (Dùng chung cho cả 3) ──────────────────────────────────
 STAGE="test"
 CANS_NUM=20
 MAX_EPOCH=5
-MAX_SAMPLES=-1    # -1 = toàn bộ dataset
-MP=16
+MAX_SAMPLES=50    # -1 = toàn bộ dataset
+MP=12              # Giảm từ 14 xuống 8 để tránh làm quá tải vLLM local server
 SEED=303
 TEMPERATURE="0.0"
 RERANKER_MODE="llm"                # llm | embed_only | hybrid
+USE_RERANKER="true"                # true | false — tắt/bật Reranker LLM
+USE_USER_AGENT="true"              # true | false — tắt/bật User Agent LLM
+# Cloudflare VLLM URL
+# MODEL="${MODEL:-qwen-small}"
+# API_KEY="${API_KEY:-empty}"
+# BASE_URL="https://sheep-pleasant-settled-synthesis.trycloudflare.com/v1"
+
+# Local URL (backup)
 MODEL="${MODEL:-qwen-research}"
 API_KEY="${API_KEY:-EMPTY}"
 BASE_URL="http://localhost:11435/v1"
@@ -45,14 +53,24 @@ for DS in "${DATASETS[@]}"; do
         MODEL_PATH="./saved_models/${DS}_best_model.pt"
         CANDIDATE_DIR="../../dataset/tasks5/${SCENARIO}/${DS}/tasks"
         FAISS_DB_PATH="./faiss_dbs/${DS}_rich"
+
         GCN_PATH="./saved_models/${DS}_gcn_emb_remapped.pt"
-        GATING_MODEL_PATH="./saved_models/moe/${DS}_gating_model.pt"
-        ITEMFILE="../../dataset/output_data_all/item.json"
-        INPUT_JSON_FILE="./data/ground_truth.json"
+        GATING_MODEL_PATH="./saved_models/moe_v23/${DS}/ce/${DS}_gating_model.pt"
+
+        if [ "$DS" == "amazon_musical" ]; then
+            ITEMFILE="../../dataset/musical_industrial/musical_amazon/item.json"
+            INPUT_JSON_FILE="./data/groundtruth_music_industrial.json"
+        elif [ "$DS" == "amazon_industrial" ]; then
+            ITEMFILE="../../dataset/musical_industrial/industrial_amazon/item.json"
+            INPUT_JSON_FILE="./data/groundtruth_music_industrial.json"
+        else
+            ITEMFILE="../../dataset/output_data_all/item.json"
+            INPUT_JSON_FILE="./data/ground_truth.json"
+        fi
 
         # --- Định nghĩa Output riêng cho từng Dataset ---
         P_MODEL="SASRec_MoE"
-        NAME="moe_rerank_fbl_v9_full"
+        NAME="moe_reranker_v4"
         OUTPUT_FILE="./output/${DS}_${SCENARIO}_${NAME}/${P_MODEL}_${MODEL}_SEED${SEED}_ep${MAX_EPOCH}.jsonl"
         RESULT_FILE="./output/${DS}_${SCENARIO}_${NAME}/evaluation_results_${NAME}_${DS}.json"
         # Tạo thư mục output
@@ -63,7 +81,7 @@ for DS in "${DATASETS[@]}"; do
         start_time=$(date +%s)
         echo ">>> Start running $DS - $SCENARIO at $(date)"
 
-        python3 ./main_moe.py \
+        /home/research/nghialt/.venv/bin/python ./main_moe.py \
             --data_dir="$DATA_DIR" \
             --model_path="$MODEL_PATH" \
             --input_json_file="$INPUT_JSON_FILE" \
@@ -79,7 +97,9 @@ for DS in "${DATASETS[@]}"; do
             --embed_model_name="sentence-transformers/all-mpnet-base-v2" \
             --gating_model_path="$GATING_MODEL_PATH" \
             --reranker_mode="$RERANKER_MODE" \
-            --reranker_top_llm=15 \
+            --use_reranker="$USE_RERANKER" \
+            --use_user_agent="$USE_USER_AGENT" \
+            --reranker_top_llm=10 \
             --model="$MODEL" \
             --api_key="$API_KEY" \
             --base_url="$BASE_URL" \
@@ -106,6 +126,9 @@ for DS in "${DATASETS[@]}"; do
         echo "============================================================" >> "$TIME_LOG"
 
         echo ">>> Finished $DS - $SCENARIO. Duration: ${duration}s. Results: $OUTPUT_FILE"
+        
+        echo ">>> Cooling down: Sleeping for 30 minutes before the next run..."
+        # sleep 1800
     done
 done
 

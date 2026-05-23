@@ -47,7 +47,7 @@ def get_args():
     parser.add_argument('--item_mapping_file', type=str, default=None)
     parser.add_argument('--raw_data_dir',      type=str, default=None)
     parser.add_argument('--stage',             type=str, default='test', choices=['train', 'val', 'test'])
-    parser.add_argument('--dataset',           type=str, default='amazon', choices=['amazon', 'yelp', 'goodreads'])
+    parser.add_argument('--dataset',           type=str, default='amazon', choices=['amazon', 'yelp', 'goodreads', 'amazon_musical', 'amazon_industrial'])
     parser.add_argument('--cans_num',  type=int, default=20)
     parser.add_argument('--max_epoch', type=int, default=3)
     parser.add_argument('--faiss_db_path', type=str, default=None)
@@ -93,7 +93,9 @@ def recommend_moe(data: dict, args) -> tuple:
                 openai_api_key=key, 
                 openai_api_base=args.base_url, 
                 temperature=args.temperature, 
-                max_retries=5
+                max_retries=5,
+                request_timeout=120,     # Thêm timeout (giây) để tránh bị treo vĩnh viễn khi vLLM nghẽn
+                max_tokens=800           # CHỐNG KẸT: Cắt đứt ngay nếu LLM sinh text vô tận
             )
         except ImportError:
             print(f"[MoE] Cảnh báo: Không thể import langchain_openai cho User {user_id}")
@@ -202,7 +204,7 @@ def recommend_moe(data: dict, args) -> tuple:
             gate_records.append([gates.get('seq', 0), gates.get('gcn', 0), gates.get('sem', 0)])
         scores = debug_info.get('scores_breakdown', {})
         for it_name, s_vals in scores.items():
-            score_records.append([s_vals.get('s0_moe', 0), s_vals.get('s_rerank', 0)])
+            score_records.append([s_vals.get('s0_moe_rank', s_vals.get('s0_moe', 0.0)), s_vals.get('s_rerank', 0.0)])
         # ----------------------------
 
         if epoch >= 2:

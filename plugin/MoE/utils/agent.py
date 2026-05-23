@@ -15,6 +15,7 @@ sys.modules['SASRecModules_ori'] = model
 
 from utils.helper_function import write_jsonl, read_jsonl, api_request
 from utils.model import SASRec
+from utils.text_processing import build_review_history, extract_item_text, ITEM_FETCH_KEYS
 
 class UserModelAgent:
     def __init__(self, args, mode='prior_rec', shared_sasrec=None):
@@ -52,13 +53,7 @@ class UserModelAgent:
 
     def build_id2name(self):
         if any(x in self.args.data_dir for x in ['yelp', 'amazon', 'goodreads']):
-            item_path = os.path.join(self.args.data_dir, 'id2name.txt')
-            with open(item_path, 'r', encoding='utf-8') as f:
-                for l in f.readlines():
-                    ll = l.strip('\n').split('::', 1)
-                    self.id2name[int(ll[0])] = ll[1].strip()
-                    self.name2id[ll[1].strip()] = int(ll[0])
-
+            # Bước 1: Đọc id2rawid trước để có raw_id cho mỗi inner_id
             rawid_path = os.path.join(self.args.data_dir, 'id2rawid.txt')
             if os.path.exists(rawid_path):
                 with open(rawid_path, 'r', encoding='utf-8') as f:
@@ -69,6 +64,21 @@ class UserModelAgent:
             else:
                 print(f"[UserModelAgent] WARNING: id2rawid.txt not found at {rawid_path}. "
                       f"Run process_data.py to generate it.")
+
+            # Bước 2: Đọc id2name và build unique name dạng "ItemName [raw_id]"
+            # Consistent với MoERecAgent._init_shared_resources() để tránh name mismatch
+            item_path = os.path.join(self.args.data_dir, 'id2name.txt')
+            with open(item_path, 'r', encoding='utf-8') as f:
+                for l in f.readlines():
+                    ll = l.strip('\n').split('::', 1)
+                    if len(ll) < 2:
+                        continue
+                    cid = int(ll[0])
+                    orig_name = ll[1].strip()
+                    raw_id = self.id2rawid.get(cid, str(cid))
+                    unique_name = f"{orig_name} [{raw_id}]"
+                    self.id2name[cid] = unique_name
+                    self.name2id[unique_name] = cid
         else:
             raise ValueError("Invalid data dir: {}".format(self.args.data_dir))
 
@@ -116,126 +126,53 @@ class UserModelAgent:
     def act(self, data, reason=None, item_list=None, docstore_cache=None):
         if self.mode == 'prior_rec':
 
-            def build_user_query(data):
-                # Fields to strip from review history (noise / irrelevant metadata)
-                _STRIP_FIELDS = {'date_added', 'date_updated', 'source', 'type',
-                                 'timestamp', 'image', 'sub_item_id', 'date',
-                                 'review_id', 'user_id'}
+            # ── Build user review history (HTML-cleaned, noise-stripped) ──
+            enriched_seq_str = build_review_history(data, id2name=self.id2name)
 
-                parts = []
-                reviews = data.get('reviews', [])
-                if reviews:
-                    if isinstance(reviews, list):
-                        id2rawid         = data.get('id2rawid', self.id2rawid)
-                        interaction_tool = data.get('interaction_tool')
+            # ── Detect dataset để extract_item_text dùng đúng logic ──────
+            _ds = next(
+                (d for d in ['yelp', 'amazon', 'goodreads'] if d in getattr(self.args, 'data_dir', '')),
+                'amazon'
+            )
 
-                        # Build mapping from raw_id -> item_name
-                        rawid2name = {str(raw): self.id2name.get(inner)
-                                      for inner, raw in id2rawid.items() if inner in self.id2name}
-
-                        candidate_ids = set()
-                        for inner_id in data.get('cans', []):
-                            raw_id = id2rawid.get(inner_id)
-                            if raw_id:
-                                candidate_ids.add(str(raw_id))
-
-                        filtered_reviews = []
-                        for r in reviews:
-                            item_id_str = str(r.get('item_id', ''))
-                            if item_id_str not in candidate_ids:
-                                # 1. Bỏ các trường noise
-                                r_copy = {k: v for k, v in r.items() if k not in _STRIP_FIELDS}
-
-                                # 2. Thêm item_name
-                                item_name = rawid2name.get(item_id_str)
-                                if item_name:
-                                    r_copy['item_name'] = item_name
-
-                                # 3. Inject categories từ interaction_tool (nếu có)
-                                if interaction_tool:
-                                    try:
-                                        fetched = interaction_tool.get_item(item_id=item_id_str)
-                                        if fetched:
-                                            cats = fetched.get('categories')
-                                            if cats:
-                                                if isinstance(cats, list):
-                                                    cats = ', '.join(str(c) for c in cats)
-                                                r_copy['categories'] = cats
-                                    except Exception:
-                                        pass
-
-                                # 4. Đưa item_id và item_name lên đầu dict
-                                ordered = {}
-                                if 'item_id'    in r_copy: ordered['item_id']    = r_copy.pop('item_id')
-                                if 'item_name'  in r_copy: ordered['item_name']  = r_copy.pop('item_name')
-                                if 'categories' in r_copy: ordered['categories'] = r_copy.pop('categories')
-                                ordered.update(r_copy)  # còn lại: stars, text, ...
-
-                                filtered_reviews.append(ordered)
-                        history_review = str(filtered_reviews)
-                    else:
-                        history_review = str(reviews)
-                    try:
-                        import tiktoken
-                        enc = tiktoken.get_encoding("cl100k_base")
-                        encoded = enc.encode(history_review)
-                        if len(encoded) > 8000: history_review = enc.decode(encoded[:8000])
-                    except Exception:
-                        if len(history_review) > 6000: history_review = history_review[:6000]
-                    parts.append(f"\n{history_review}")
-                else:
-                    seq_str = data.get('seq_str', '') or ''
-                    if seq_str and seq_str.strip() and seq_str != 'Empty History':
-                        words = seq_str.split()
-                        parts.append(f"{' '.join(words[-80:])}")
-                return "\n\n".join(parts) if parts else ""
-
+            # ── Enrich Top-5 item_list với metadata từ interaction_tool ───
             def enrich_candidates(items_input):
-                if not items_input: return "None"
-                items = [i.strip() for i in items_input.split(',')] if isinstance(items_input, str) else items_input
+                if not items_input:
+                    return "None"
+                items = items_input if isinstance(items_input, list) \
+                        else [i.strip() for i in str(items_input).split(',')]
                 interaction_tool = data.get('interaction_tool')
                 id2rawid = data.get('id2rawid', self.id2rawid)
                 if not interaction_tool:
-                    return ", ".join(items) if isinstance(items, list) else items_input
+                    return ", ".join(items)
 
                 enriched = []
-                keys = ['average_rating', 'stars', 'review_count', 'categories', 'description']
                 for idx, item in enumerate(items, 1):
                     inner_id = self.name2id.get(item)
-                    raw_id = id2rawid.get(inner_id) if inner_id is not None else None
+                    raw_id   = id2rawid.get(inner_id) if inner_id is not None else None
+                    info_dict = {'Target_Name': item}
                     if raw_id:
                         try:
                             fetched = interaction_tool.get_item(item_id=raw_id)
                             if fetched:
-                                details = []
-                                for k in keys:
-                                    v = fetched.get(k)
-                                    if v:
-                                        if k == 'description' and isinstance(v, str) and len(v) > 150:
-                                            v = v[:150] + '...'
-                                        if k == 'categories' and isinstance(v, str) and len(v) > 100:
-                                            v = v[:100] + '...'
-                                        details.append(f"{k}: {v}")
-                                if details:
-                                    enriched.append(f'#{idx}: "{item}" — {", ".join(details)}')
-                                else:
-                                    enriched.append(f'#{idx}: "{item}"')
-                                continue
-                        except Exception: pass
-                    enriched.append(f'#{idx}: "{item}"')
+                                for k in ITEM_FETCH_KEYS:
+                                    if k in fetched:
+                                        info_dict[k] = fetched[k]
+                        except Exception:
+                            pass
+                    detail_str = extract_item_text(info_dict, _ds)
+                    if detail_str and detail_str != 'No additional info':
+                        enriched.append(f'#{idx}: "{item}" \u2014 {detail_str}')
+                    else:
+                        enriched.append(f'#{idx}: "{item}"')
                 return "\n".join(enriched)
 
-            # Build user query based on reviews to avoid data leakage
-            enriched_seq_str = build_user_query(data)
-
-            # ── PATCH: Enrich Top-5 item_list với metadata từ interaction_tool ──
             if item_list is not None:
                 items_raw = item_list if isinstance(item_list, list) \
                             else [i.strip() for i in str(item_list).split(',')]
                 enriched_item_list = enrich_candidates(items_raw)
             else:
                 enriched_item_list = "None"
-            # ────────────────────────────────────────────────────────────────
 
             if len(self.memory) == 0:
                 system_prompt = self.user_system_prompt.format(enriched_seq_str)

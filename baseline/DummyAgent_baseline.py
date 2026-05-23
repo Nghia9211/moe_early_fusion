@@ -13,24 +13,6 @@ from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
 
-def get_review_time(r):
-    try:
-        if r.get('source') == 'amazon':
-            return float(r.get('timestamp', 0))  # dùng trực tiếp
-
-        elif r.get('source') == 'yelp':
-            return datetime.strptime(
-                r.get('date'),
-                "%Y16%m-%d %H:%M:%S"
-            ).timestamp()
-
-        elif r.get('source') == 'goodreads':
-            return datetime.strptime(
-                r.get('date_added'),
-                "%a %b %d %H:%M:%S %z %Y"
-            ).timestamp()
-    except:
-        return 0.0
 
 
 def num_tokens_from_string(string: str) -> int:
@@ -124,10 +106,16 @@ if __name__ == "__main__":
     )
 
 
-    simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
+    # simulator = Simulator(data_dir="../dataset/output_data_all/", device="gpu", cache=True)
+    # simulator.set_task_and_groundtruth(
+    #     task_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/tasks",
+    #     groundtruth_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/groundtruth",
+    # )
+
+    simulator = Simulator(data_dir="../dataset/musical_industrial/musical_amazon", device="gpu", cache=True)
     simulator.set_task_and_groundtruth(
-        task_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/tasks",
-        groundtruth_dir=f"../dataset/tasks5/{scenario}/{args.task_set}/groundtruth",
+        task_dir=f"../dataset/tasks5/{scenario}/amazon_musical/tasks",
+        groundtruth_dir=f"../dataset/tasks5/{scenario}/amazon_musical/groundtruth",
     )
 
     # simulator = Simulator(data_dir="../musical_industrial/industrial_amazon", device="gpu", cache=True)
@@ -142,6 +130,6 @@ if __name__ == "__main__":
     evaluation_results = simulator.evaluate()
 
     os.makedirs(f'./results/{scenario}', exist_ok=True)
-    with open(f'./results/{scenario}/evaluation_results_DummyAgent_{task_set}_videogame.json', 'w') as f:
+    with open(f'./results/{scenario}/evaluation_results_DummyAgent_{task_set}_musical_amazon.json', 'w') as f:
         json.dump(evaluation_results, f, indent=4)
     print(f"The evaluation_results for {task_set} is: {evaluation_results}")

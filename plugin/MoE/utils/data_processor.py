@@ -58,7 +58,9 @@ def load_item_name_map(mapping_file):
             try:
                 item = json.loads(line)
                 name = item.get('title') or item.get('name') or "Unknown"
-                name_map[str(item.get('item_id')).strip()] = name.strip()
+                asin = item.get('asin') or item.get('item_id') or "Unknown"
+                unique_name = f"{name.strip()} [{asin.strip()}]"
+                name_map[str(item.get('item_id')).strip()] = unique_name
             except: continue
     return name_map
 def prepare_merge_data(new_input_list, data_map, candidate_map, item_id_to_name_map, user_agent_sasrec, args):
@@ -66,13 +68,26 @@ def prepare_merge_data(new_input_list, data_map, candidate_map, item_id_to_name_
     skipped = 0
     padding_id = 0
 
+    # Build reverse mapping: raw_id (ASIN) → inner_id
+    # id2rawid maps inner_id → ASIN, we need ASIN → inner_id
+    rawid2id = {}
+    if hasattr(user_agent_sasrec, 'id2rawid') and user_agent_sasrec.id2rawid:
+        rawid2id = {v: k for k, v in user_agent_sasrec.id2rawid.items()}
+    
+    total_missing = 0
+    total_invalid = 0
+    missing_examples = []  # Lưu vài ví dụ để debug
+
     for entry in tqdm(new_input_list, desc="Merging Data"):
         user_id = str(entry.get('user_id'))
         gt_item_id = str(entry.get('item_id', '')).strip()
         
         # --- DEBUG GROUND TRUTH ---
+        # Thử tìm inner_id từ ASIN trước
+        gt_inner_id = rawid2id.get(gt_item_id)
         name_from_map = item_id_to_name_map.get(gt_item_id)
-        name_from_model = user_agent_sasrec.id2name.get(int(gt_item_id) if gt_item_id.isdigit() else -1)
+        name_from_model = user_agent_sasrec.id2name.get(gt_inner_id) if gt_inner_id is not None else \
+                          user_agent_sasrec.id2name.get(int(gt_item_id) if gt_item_id.isdigit() else -1)
         
         if not name_from_map and not name_from_model:
             print(f"\n[CRITICAL] Ground Truth Item {gt_item_id} (User: {user_id}) KHÔNG TỒN TẠI trong item.json lẫn id2name.txt!")
@@ -91,20 +106,26 @@ def prepare_merge_data(new_input_list, data_map, candidate_map, item_id_to_name_
             for rid in candidate_map[user_id]:
                 rid_str = str(rid).strip()
                 
-                # Tìm tên
-                name = item_id_to_name_map.get(rid_str) or user_agent_sasrec.id2name.get(int(rid_str) if rid_str.isdigit() else -1) or rid_str
+                # Bước 1: Thử tra trực tiếp ASIN → inner_id qua rawid2id
+                iid = rawid2id.get(rid_str)
                 
-                # Tìm ID trong mô hình SASRec
-                iid = user_agent_sasrec.name2id.get(name)
+                if iid is not None:
+                    # Tìm thấy inner_id → lấy tên từ id2name
+                    name = user_agent_sasrec.id2name.get(iid, rid_str)
+                else:
+                    # Bước 2: Fallback - thử tìm tên rồi tra name2id (cho trường hợp rid là inner_id số)
+                    name = item_id_to_name_map.get(rid_str) or user_agent_sasrec.id2name.get(int(rid_str) if rid_str.isdigit() else -1) or rid_str
+                    iid = user_agent_sasrec.name2id.get(name)
                 
-                # --- DEBUG CANDIDATES ---
+                # Item không tồn tại trong model SASRec (cold-start item)
                 if iid is None:
-                    # ĐÂY LÀ NGUYÊN NHÂN GÂY LỖI: Item có trong danh sách ứng viên nhưng mô hình không biết nó là gì
-                    print(f"[MISSING ITEM] Item '{name}' (ID: {rid_str}) không có trong từ điển Model. Sẽ bị loại bỏ khỏi cans.")
-                    continue # Bỏ qua item này, không thêm vào new_ids
+                    total_missing += 1
+                    if len(missing_examples) < 5:
+                        missing_examples.append(f"  '{name}' (ID: {rid_str})")
+                    continue
                 
                 if iid >= user_agent_sasrec.item_num:
-                    print(f"[INVALID ID] Item '{name}' có ID {iid} >= item_num {user_agent_sasrec.item_num}. Sẽ bị loại bỏ.")
+                    total_invalid += 1
                     continue
 
                 new_names.append(name)
@@ -132,5 +153,17 @@ def prepare_merge_data(new_input_list, data_map, candidate_map, item_id_to_name_
             print(f"\n[ERROR] Lỗi tại model_generate cho User {user_id}: {e}")
             print(f"Dữ liệu gây lỗi - Cans: {data.get('cans')}, Item_num: {user_agent_sasrec.item_num}")
             skipped += 1
+    
+    # In tóm tắt cuối cùng thay vì spam từng item
+    if total_missing > 0:
+        print(f"\n[MISSING ITEMS SUMMARY] {total_missing} candidate items không có trong model SASRec (cold-start items bị lọc khi tiền xử lý).")
+        print(f"  → Nguyên nhân: Candidate list chứa ASIN không nằm trong id2rawid.txt/id2name.txt")
+        print(f"  → Các item này đã bị bỏ qua (không ảnh hưởng kết quả).")
+        if missing_examples:
+            print(f"  → Ví dụ ({len(missing_examples)} mẫu):")
+            for ex in missing_examples:
+                print(ex)
+    if total_invalid > 0:
+        print(f"[INVALID IDs SUMMARY] {total_invalid} items có inner_id >= item_num, đã bị loại bỏ.")
             
     return merge_data_list, skipped

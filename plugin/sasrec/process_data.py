@@ -4,17 +4,18 @@ import pandas as pd
 import collections
 from tqdm import tqdm
 from datetime import datetime
-
-RAW_DIR           = '../../dataset/output_data_all'
+# RAW_DIR           = '../../dataset/output_data_all'
+RAW_DIR           = '../../dataset/musical_industrial/industrial_amazon'
 OUTPUT_DIR        = '../MoE/data'
-GROUND_TRUTH_FILE = '../MoE/data/ground_truth.json'
+# GROUND_TRUTH_FILE = '../MoE/data/ground_truth.json'
+GROUND_TRUTH_FILE = '../MoE/data/groundtruth_music_industrial.json'
 MAX_SEQ_LEN       = 50
 MIN_INTERACTION   = 5   # user phải có ít nhất 5 interactions
 
 
 def get_normalized_timestamp(data, source):
     try:
-        if source == 'amazon':
+        if source == 'amazon' or source == 'amazon_industrial' or source == 'amazon_musical':
             return int(data.get('timestamp', 0))
         elif source == 'yelp':
             date_str = data.get('date')
@@ -322,5 +323,5 @@ def process_source(target_source):
 
 
 if __name__ == "__main__":
-    for source in ['amazon']:
+    for source in ['amazon_industrial']:
         process_source(source)
