@@ -91,8 +91,16 @@ def _llm_rerank(
          if d in str(data.get('output_dir', ''))),
         'amazon'
     )
-    task_type = {"goodreads": "Goodreads", "yelp": "Yelp", "amazon": "Amazon"}.get(dataset, "Platform")
-    task_item = {"goodreads": "book", "yelp": "business", "amazon": "product"}.get(dataset, "item")
+    task_type = {
+        "goodreads": "Goodreads", "yelp": "Yelp", "amazon": "Amazon",
+        "amazon_musical": "Amazon Musical Instruments",
+        "amazon_industrial": "Amazon Industrial & Scientific",
+    }.get(dataset, "Amazon")
+    task_item = {
+        "goodreads": "book", "yelp": "business", "amazon": "product",
+        "amazon_musical": "musical instrument or accessory",
+        "amazon_industrial": "industrial or scientific product",
+    }.get(dataset, "product")
 
     interaction_tool = data.get('interaction_tool')
     id2rawid         = data.get('id2rawid', {})
@@ -181,12 +189,66 @@ REFINEMENT INSTRUCTIONS:{positive_items_text}
 3. For items not mentioned: use the user's review history and item descriptions to determine the best order.
 4. Output ranked_indices as the item #N numbers from the ML ranking above, ordered from best to worst.
    Example: if #3 is best, then #1, then #2 → ranked_indices: [3, 1, 2, ...]. Include all {len(cans_to_rank)} indices.
-5. Provide a brief explanation of your changes."""
+5. Provide a brief explanation of your changes (≤30 words)."""
 
     else:
+        # ── FEW-SHOT EXAMPLE (compact, ~250 tokens, platform-specific) ──────
+        _few_shot_by_ds = {
+            "goodreads": f"""\
+=== FORMAT EXAMPLE (fictional — for format guidance only) ===
+User history (PAST reads — NOT candidates):
+  [{{'item_name': 'Harry Potter [hp1]', 'stars': 5, 'text': 'Amazing fantasy!'}}]
+ML Ranking:
+  #1: "Twilight [tw1]" — rating: 3.8, shelves: romance
+  #2: "The Hobbit [ho1]" — rating: 4.7, shelves: fantasy, adventure
+  #3: "Cooking Basics [cb1]" — rating: 4.0, shelves: cooking
+→ Swap justified (user history: strong fantasy preference):
+  ranked_indices: [2, 1, 3]  explanation: "Promoted #2: user clearly prefers fantasy (5★). #3 kept last."
+→ No swap needed (ML already correct):
+  ranked_indices: [1, 2, 3]  explanation: "ML ranking preserved."
+=== END EXAMPLE ===
+⚠️  Review History = PAST items already read. Candidates = ONLY #1–#{len(cans_to_rank)} below.
+To keep ML order exactly → ranked_indices: [1, 2, ..., {len(cans_to_rank)}].""",
+
+            "amazon": f"""\
+=== FORMAT EXAMPLE (fictional — for format guidance only) ===
+User history (PAST purchases — NOT candidates):
+  [{{'item_name': 'Wireless Headphones [B001]', 'stars': 5, 'text': 'Great sound quality!'}}]
+ML Ranking:
+  #1: "Bluetooth Speaker [B002]" — rating: 4.1, categories: Electronics
+  #2: "Running Shoes [B003]" — rating: 4.5, categories: Sports
+  #3: "USB-C Headphones [B004]" — rating: 4.6, categories: Electronics, Audio
+→ Swap justified (user: electronics/audio preference):
+  ranked_indices: [3, 1, 2]  explanation: "Promoted #3: strong audio preference from history. #2 (Sports) kept last."
+→ No swap needed:
+  ranked_indices: [1, 2, 3]  explanation: "ML ranking preserved."
+=== END EXAMPLE ===
+⚠️  Review History = PAST purchases. Candidates = ONLY #1–#{len(cans_to_rank)} below.
+To keep ML order exactly → ranked_indices: [1, 2, ..., {len(cans_to_rank)}].""",
+
+            "yelp": f"""\
+=== FORMAT EXAMPLE (fictional — for format guidance only) ===
+User history (PAST visits — NOT candidates):
+  [{{'item_name': 'Pho Saigon [ys1]', 'stars': 5, 'text': 'Best Vietnamese food!'}}]
+ML Ranking:
+  #1: "Burger Palace [yb1]" — stars: 3.8, categories: Fast Food
+  #2: "Pho Hanoi [yp1]" — stars: 4.7, categories: Vietnamese, Asian
+  #3: "Sushi World [ys2]" — stars: 4.2, categories: Japanese
+→ Swap justified (user: Vietnamese food preference):
+  ranked_indices: [2, 3, 1]  explanation: "Promoted #2: user clearly prefers Vietnamese (5★)."
+→ No swap needed:
+  ranked_indices: [1, 2, 3]  explanation: "ML ranking preserved."
+=== END EXAMPLE ===
+⚠️  Review History = PAST visits. Candidates = ONLY #1–#{len(cans_to_rank)} below.
+To keep ML order exactly → ranked_indices: [1, 2, ..., {len(cans_to_rank)}].""",
+        }
+        _few_shot_block = _few_shot_by_ds.get(dataset, _few_shot_by_ds["amazon"])
+
         prompt = f"""You are a recommendation refinement system for {task_item}s on {task_type}.
 A specialized ML recommendation model has already ranked candidate {task_item}s for this user using multiple signals (sequential behavior patterns, collaborative filtering, and content similarity). Your job is to REFINE this ranking — not rebuild it from scratch.
 The ML ranking is statistically reliable. Make MINIMAL adjustments only when clearly justified.
+
+{_few_shot_block}
 
 User's Profile & Review History:
 {user_query}
@@ -195,11 +257,13 @@ ML Model's Ranking (most recommended → least recommended):
 {ranked_display}
 
 REFINEMENT INSTRUCTIONS:
-1. Only swap items if you see CLEAR, SPECIFIC evidence in the user's review history that a lower-ranked item better matches their preferences.
-2. Key signals: category/genre alignment, rating patterns, specific features the user mentions in reviews.
-3. Output ranked_indices as the item #N numbers from the ML ranking above, ordered from best to worst.
+1. CRITICAL: The ML model is statistically highly accurate. You must DEFAULT to preserving the ML ranking.
+2. DO NOT demote the ML's #1 or #2 items unless they completely contradict the user's explicit preferences.
+3. Only swap items if you are HIGHLY CONFIDENT (>90%) based on concrete proof in the review text. If unsure, output the original ML order.
+4. Key signals: category/genre alignment, rating patterns, specific features the user mentions in reviews.
+5. Output ranked_indices as the item #N numbers from the ML ranking above, ordered from best to worst.
    Example: if #3 is best, then #1, then #2 → ranked_indices: [3, 1, 2, ...]. Include all {len(cans_to_rank)} indices.
-4. Provide a brief explanation of your changes, or 'ML ranking preserved' if no changes were needed."""
+6. Provide a brief explanation of your changes (≤30 words), or 'ML ranking preserved' if no changes were needed."""
 
     # ── DIALOGUE LOGGING TO FILE (for paper) ──
     import os
@@ -241,20 +305,30 @@ REFINEMENT INSTRUCTIONS:
     ranked      = list(cans_to_rank)     # fallback: giữ nguyên ML order
     explanation = "(no explanation)"
     try:
-        # ── PRIMARY: with_structured_output (schema-enforced JSON) ────────────
-        # LLM trả về ranked_indices (List[int], 1-based) → map về tên gốc.
-        # Loại bỏ hoàn toàn name-mismatch: index không bao giờ sai.
-        #
-        # CRITICAL: bind max_tokens TRƯỚC with_structured_output.
-        # ChatOpenAI.max_tokens KHÔNG được forward tự động qua vLLM's structured-
-        # output endpoint → model sinh vô hạn token → LengthFinishReasonError.
-        # 512 tokens = 10 indices (~30 tok) + explanation (~100 tok) + JSON (~50 tok)
-        # với buffer dư. Đủ dùng, không bao giờ trigger unbounded generation.
-        _MAX_OUTPUT = 512
+        _MAX_OUTPUT = 1024  # tăng từ 512: tránh LengthFinishReasonError khi output 10 indices + explanation
         structured_llm  = llm.bind(max_tokens=_MAX_OUTPUT).with_structured_output(_RankerOutput)
         result          = structured_llm.invoke(prompt)
         raw_indices     = result.ranked_indices   # e.g. [3, 1, 2, 5, 4, ...]
         explanation     = result.explanation
+
+        # ── Enrich explanation: replace #N → item name thực ───────────────
+        # LLM viết "#1 and #3" nhưng User Agent không biết #N là item gì.
+        # Thay bằng tên thực từ ML ranking gốc (cans_to_rank) để UA hiểu đúng.
+        # Ví dụ: "Swapped #1 and #3" → "Swapped "The Hobbit" (#1) and "Cooking Basics" (#3)"
+        import re as _re_expl
+        def _short_name(full_name: str) -> str:
+            """Bỏ [item_id] suffix: 'Harry Potter [B001]' → 'Harry Potter'"""
+            return _re_expl.sub(r'\s*\[[^\]]*\]\s*$', '', full_name).strip()
+
+        def _replace_index_ref(m):
+            n = int(m.group(1))
+            if 1 <= n <= len(cans_to_rank):
+                return f'"{_short_name(cans_to_rank[n - 1])}" (#{n})'
+            return m.group(0)
+
+        if explanation and explanation not in ('(no explanation)', 'ML ranking preserved.', 'ML ranking preserved'):
+            explanation = _re_expl.sub(r'#(\d+)', _replace_index_ref, explanation)
+        # ──────────────────────────────────────────────────────────────────
 
         # ── Map index → tên (1-based, clamp ngoài khoảng) ─────────────────
         n = len(cans_to_rank)

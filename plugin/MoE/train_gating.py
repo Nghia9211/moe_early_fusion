@@ -25,7 +25,7 @@ Cải tiến so với v2.2:
 """
 
 import os, sys, argparse, math, numpy as np, pandas as pd
-import torch, torch.nn as nn, torch.optim as optim
+import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
@@ -195,13 +195,22 @@ def compute_batch_scores(
         node_embs = getattr(gcn_scorer, 'node_embs', {})  # Dict[str, Tensor]
         h_users = []
         for i in range(B):
-            uid = str(batch_user_ids[i]) if batch_user_ids is not None else None
+            # Fix Bug #2: xử lý đúng khi batch_user_ids chứa Tensor (str(tensor(123)) = "tensor(123)" ≠ "123")
+            raw_uid = batch_user_ids[i] if batch_user_ids is not None else None
+            if raw_uid is not None:
+                uid = str(raw_uid.item()) if hasattr(raw_uid, 'item') else str(raw_uid)
+            else:
+                uid = None
             h_u = node_embs.get(uid) if uid is not None else None
             if h_u is None:
                 h_u = torch.zeros(gcn_scorer.gcn_norm.shape[1], device=device)
-            h_users.append(h_u.to(device))
+            else:
+                # Fix Bug #1: normalize user embedding — nhất quán với GCNScorer.score() inference
+                # gcn_norm (items) đã L2-normalize, h_u phải normalize để dot = cosine sim
+                h_u = F.normalize(h_u.to(device).float(), dim=0)
+            h_users.append(h_u)
         h_users = torch.stack(h_users)                     # (B, dim)
-        all_gcn_logits = h_users @ gcn_scorer.gcn_norm.T   # (B, num_items)
+        all_gcn_logits = h_users @ gcn_scorer.gcn_norm.T   # (B, num_items) — true cosine sim
 
     # ── Semantic scores (batched FAISS) ──────────────────────────────────────
     sem_map = [{} for _ in range(B)]
@@ -603,7 +612,7 @@ def main():
     parser.add_argument('--gcn_path',    default=None)
     parser.add_argument('--faiss_path',  default=None)
     parser.add_argument('--output_dir',  default='./saved_models/moe')
-    parser.add_argument('--dataset',     default='amazon', choices=['amazon', 'yelp', 'goodreads'])
+    parser.add_argument('--dataset',     default='amazon', choices=['amazon', 'yelp', 'goodreads', 'amazon_industrial', 'amazon_musical'])
     parser.add_argument('--epochs',      type=int,   default=50)
     parser.add_argument('--lr',          type=float, default=1e-3)
     parser.add_argument('--batch_size',  type=int,   default=256)

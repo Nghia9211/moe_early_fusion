@@ -107,7 +107,11 @@ class UserModelAgent:
 
     def load_prompt(self):
         if self.mode == 'prior_rec':
-            if 'amazon' in self.args.data_dir:
+            if 'amazon_musical' in self.args.data_dir:
+                from constant.amazon_musical_prior_model_prompt import user_system_prompt, user_user_prompt, user_memory_system_prompt, user_memory_user_prompt, user_build_memory, user_build_memory_2
+            elif 'amazon_industrial' in self.args.data_dir:
+                from constant.amazon_industrial_prior_model_prompt import user_system_prompt, user_user_prompt, user_memory_system_prompt, user_memory_user_prompt, user_build_memory, user_build_memory_2
+            elif 'amazon' in self.args.data_dir:
                 from constant.amazon_prior_model_prompt import user_system_prompt, user_user_prompt, user_memory_system_prompt, user_memory_user_prompt, user_build_memory, user_build_memory_2
             elif 'goodreads' in self.args.data_dir:
                 from constant.goodreads_prior_model_prompt import user_system_prompt, user_user_prompt, user_memory_system_prompt, user_memory_user_prompt, user_build_memory, user_build_memory_2
@@ -176,20 +180,14 @@ class UserModelAgent:
 
             if len(self.memory) == 0:
                 system_prompt = self.user_system_prompt.format(enriched_seq_str)
-                # Avoid duplicating large history in user prompt if already in system prompt
-                user_history_placeholder = "As detailed in your reading history above" 
                 user_prompt = self.user_user_prompt.format(
-                    user_history_placeholder,
                     enriched_item_list,
                     reason,
                 )
             else:
                 system_prompt = self.user_memory_system_prompt.format(enriched_seq_str)
-                # Truncate memory to last 2 rounds to save context
                 memory_str = '\n'.join(self.memory[-2:])
-                user_history_placeholder = "As detailed in your reading history above"
                 user_prompt = self.user_memory_user_prompt.format(
-                    user_history_placeholder,
                     memory_str,
                     enriched_item_list,
                     reason,

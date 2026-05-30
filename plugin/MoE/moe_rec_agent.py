@@ -39,7 +39,9 @@ class MoERecAgent:
         self.info_list:    List[dict] = []
         self.item_name_map = item_name_map or {}
         self.llm           = llm
-        self.dataset = next((d for d in ['yelp', 'amazon', 'goodreads'] if d in getattr(args, 'data_dir', '')), 'amazon')
+        self.dataset = getattr(args, 'dataset', None) or next(
+            (d for d in ['yelp', 'amazon', 'goodreads'] if d in getattr(args, 'data_dir', '')), 'amazon'
+        )
         self.cfg = get_config_for_dataset()
 
         with MoERecAgent._init_lock:
@@ -184,6 +186,23 @@ class MoERecAgent:
             avg_gates = fusion_debug.get('avg_gates', {'seq': 0.0, 'gcn': 0.0, 'sem': 0.0})
             s0_rank_scores = {item: 1.0 / math.log2(rank + 2) for rank, item in enumerate(c_m)}
 
+            # ── [Exp 11] Top-K per expert within the top-M pool ──────────────
+            def _expert_topk(expert_key: str, items: list, k: int = 5) -> list:
+                """Lấy top-k items trong pool theo score của 1 expert."""
+                scores = signal_scores.get(expert_key, {})
+                ranked = sorted([i for i in items if i in scores],
+                                key=lambda x: scores.get(x, 0.0), reverse=True)
+                # Nếu expert không score item nào thì fallback theo MoE order
+                if not ranked:
+                    return items[:k]
+                return ranked[:k]
+
+            expert_top_k = {
+                'seq': _expert_topk('seq', c_m, k=self.cfg.retrieval.top_K),
+                'gcn': _expert_topk('gcn', c_m, k=self.cfg.retrieval.top_K),
+                'sem': _expert_topk('sem', c_m, k=self.cfg.retrieval.top_K),
+            }
+
             # =========================================================
             # 🔥 ABLATION: NẾU TẮT RERANKER, TRẢ VỀ KẾT QUẢ MOE LUÔN
             # =========================================================
@@ -196,6 +215,7 @@ class MoERecAgent:
                     'alpha': 1.0, 
                     'top_M_size': len(c_m),
                     'avg_gates': avg_gates, 
+                    'expert_top_k': expert_top_k,
                     'c_m_top_k_before_rerank': c_k, 
                     'c_k_final_after_rerank': c_k,
                     'scores_breakdown': {
@@ -227,6 +247,7 @@ class MoERecAgent:
                 'alpha': combine_debug.get('alpha', 0.0), 
                 'top_M_size': len(c_m),
                 'avg_gates': avg_gates, 
+                'expert_top_k': expert_top_k,
                 'c_m_top_k_before_rerank': c_m[:self.cfg.retrieval.top_K], 
                 'c_k_final_after_rerank': c_k,
                 'scores_breakdown': {
@@ -253,7 +274,9 @@ class MoERecAgent:
 
     def _load_build_memory_template(self):
         try:
-            if 'amazon' in self.args.data_dir: from constant.amazon_prior_model_prompt import rec_build_memory
+            if 'amazon_musical' in self.args.data_dir: from constant.amazon_musical_prior_model_prompt import rec_build_memory
+            elif 'amazon_industrial' in self.args.data_dir: from constant.amazon_industrial_prior_model_prompt import rec_build_memory
+            elif 'amazon' in self.args.data_dir: from constant.amazon_prior_model_prompt import rec_build_memory
             elif 'goodreads' in self.args.data_dir: from constant.goodreads_prior_model_prompt import rec_build_memory
             elif 'yelp' in self.args.data_dir: from constant.yelp_prior_model_prompt import rec_build_memory
             else: rec_build_memory = "Round {}: Recommended {} because {}. Rejected because {}."

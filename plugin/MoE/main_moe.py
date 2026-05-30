@@ -61,7 +61,9 @@ def get_args():
     parser.add_argument('--rerank_only', action='store_true')
     parser.add_argument('--model',       type=str, default='qwen-small')
     parser.add_argument('--api_key',     type=str, default=None)
-    parser.add_argument('--base_url',    type=str, default='http://localhost:8036/v1')
+    parser.add_argument('--base_url',    type=str, default=None,
+                        help='LLM API base URL. None/empty = OpenAI default (api.openai.com). Set to local vLLM URL when using local model.')
+
     parser.add_argument('--temperature', type=float, default=0.0)
     parser.add_argument('--mp',             type=int, default=4)
     parser.add_argument('--seed',           type=int, default=333)
@@ -87,16 +89,27 @@ def recommend_moe(data: dict, args) -> tuple:
     if need_llm:
         try:
             from langchain_openai import ChatOpenAI
-            key = args.api_key if args.api_key and args.api_key.lower() != 'none' else "EMPTY"
-            llm_client = ChatOpenAI(
-                model=args.model, 
-                openai_api_key=key, 
-                openai_api_base=args.base_url, 
-                temperature=args.temperature, 
-                max_retries=5,
-                request_timeout=120,     # Thêm timeout (giây) để tránh bị treo vĩnh viễn khi vLLM nghẽn
-                max_tokens=800           # CHỐNG KẸT: Cắt đứt ngay nếu LLM sinh text vô tận
+            key = args.api_key if args.api_key and args.api_key.lower() not in ('none', 'empty') else "EMPTY"
+            base_url = getattr(args, 'base_url', None)
+
+            llm_kwargs = dict(
+                model           = args.model,
+                openai_api_key  = key,
+                temperature     = args.temperature,
+                max_retries     = 5,
+                request_timeout = 120,
+                max_tokens      = 800,
             )
+            # Chỉ set base_url khi có giá trị thực → local vLLM
+            # Khi rỗng / None → langchain dùng https://api.openai.com/v1 (OpenAI API mặc định)
+            if base_url and base_url.strip():
+                llm_kwargs['openai_api_base'] = base_url.strip()
+
+            is_openai = not (base_url and base_url.strip())
+            backend   = f"OpenAI API ({args.model})" if is_openai else f"local vLLM @ {base_url}"
+            print(f"[MoE][User {user_id}] LLM backend: {backend}")
+
+            llm_client = ChatOpenAI(**llm_kwargs)
         except ImportError:
             print(f"[MoE] Cảnh báo: Không thể import langchain_openai cho User {user_id}")
         except Exception as e:
@@ -130,7 +143,6 @@ def recommend_moe(data: dict, args) -> tuple:
     ndcg_v1        = 0.0
     ndcg_final     = 0.0
     moe_only_ndcg  = 0.0
-    moe_confidence = 0.0
     hit_v1         = {1: False, 3: False, 5: False}
     gate_records   = []
     score_records  = []
@@ -187,8 +199,6 @@ def recommend_moe(data: dict, args) -> tuple:
             if current_rank <= 3: hit_v1[3] = True
             if current_rank <= 5: hit_v1[5] = True
 
-            # --- MOE CONFIDENCE ---
-            moe_confidence = debug_info.get('moe_confidence', 0.0)
 
             # --- MOE ONLY NDCG (before Reranker) ---
             c_m_top_k = debug_info.get('c_m_top_k_before_rerank', [])
@@ -312,7 +322,7 @@ def recommend_moe(data: dict, args) -> tuple:
 
         epoch += 1
 
-    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg, moe_confidence, reranker_impact_logs
+    return new_data_list, hit_at_n, args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_records, score_records, hit_v1, moe_only_ndcg, reranker_impact_logs
 
 
 def error_handler(e):
@@ -336,12 +346,11 @@ def make_counters(manager):
         'equal_count': manager.Value('i', 0),
         'gate_vals': manager.list(),
         'score_vals': manager.list(),
-        'confidence_records': manager.list(),  # (confidence, moe_ndcg, v1_ndcg)
         'lock': manager.Lock(),
     }
 
 def setcallback_safe(result, counters, args):
-    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg, moe_confidence, reranker_impact_logs = result
+    data_list, hit_at_n, _args, drop_logs, improve_logs, ndcg_v1, ndcg_final, gate_recs, score_recs, hit_v1, moe_only_ndcg, reranker_impact_logs = result
     for step in data_list: append_jsonl(args.output_file, step)
 
     # --- LƯU LOG VÀO FILE ---
@@ -402,7 +411,6 @@ def setcallback_safe(result, counters, args):
         if hit_v1.get(5): counters['total_hit5_v1'].value += 1
         counters['gate_vals'].extend(gate_recs)
         counters['score_vals'].extend(score_recs)
-        counters['confidence_records'].append([moe_confidence, moe_only_ndcg, ndcg_v1])
         
         if hit_at_n.get(1): counters['correct_hit1'].value += 1
         if hit_at_n.get(3): counters['correct_hit3'].value += 1
@@ -533,66 +541,7 @@ def main(args):
             df_gates.to_csv(csv_path, index=False)
             print(f"✅ Đã lưu file CSV Gating Logs tại: {csv_path}")
 
-        # ── CONFIDENCE vs NDCG ANALYSIS ──────────────────────────────────
-        conf_records = list(counters['confidence_records'])
-        if conf_records:
-            df_conf = pd.DataFrame(conf_records, columns=['confidence', 'moe_ndcg', 'v1_ndcg'])
-            df_conf['reranker_boost'] = df_conf['v1_ndcg'] - df_conf['moe_ndcg']
 
-            # Save raw CSV
-            conf_csv = os.path.join(output_dir, 'confidence_ndcg_analysis.csv')
-            df_conf.to_csv(conf_csv, index=False)
-            print(f"✅ Saved confidence analysis CSV: {conf_csv}")
-
-            # Bucketed analysis
-            buckets = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
-            bucket_lines = []
-            bucket_lines.append("=" * 80)
-            bucket_lines.append("📊 CONFIDENCE vs NDCG ANALYSIS (Debug — Pre-Implementation)")
-            bucket_lines.append("=" * 80)
-            bucket_lines.append(f"{'Confidence Bucket':<22} {'Count':>6} {'Avg MoE NDCG':>14} {'Avg V1 NDCG':>13} {'Avg Boost':>11} {'Reranker Helped':>16} {'Reranker Hurt':>14}")
-            bucket_lines.append("-" * 100)
-
-            for lo, hi in buckets:
-                mask = (df_conf['confidence'] >= lo) & (df_conf['confidence'] < hi)
-                subset = df_conf[mask]
-                n = len(subset)
-                if n == 0:
-                    bucket_lines.append(f"[{lo:.1f} - {hi:.1f})       {0:>6}     {'N/A':>14} {'N/A':>13} {'N/A':>11} {'N/A':>16} {'N/A':>14}")
-                    continue
-                avg_moe = subset['moe_ndcg'].mean()
-                avg_v1 = subset['v1_ndcg'].mean()
-                avg_boost = subset['reranker_boost'].mean()
-                helped = (subset['reranker_boost'] > 0).sum()
-                hurt = (subset['reranker_boost'] < 0).sum()
-                bucket_lines.append(
-                    f"[{lo:.1f} - {hi:.1f})       {n:>6}       {avg_moe:>8.4f}       {avg_v1:>7.4f}     {avg_boost:>+7.4f}          {helped:>6}        {hurt:>6}"
-                )
-            bucket_lines.append("-" * 100)
-            bucket_lines.append(
-                f"{'TOTAL':<22} {len(df_conf):>6}       {df_conf['moe_ndcg'].mean():>8.4f}       {df_conf['v1_ndcg'].mean():>7.4f}     {df_conf['reranker_boost'].mean():>+7.4f}"
-                f"          {(df_conf['reranker_boost'] > 0).sum():>6}        {(df_conf['reranker_boost'] < 0).sum():>6}"
-            )
-            bucket_lines.append("=" * 80)
-
-            # Correlation
-            from scipy.stats import spearmanr as _sp_corr
-            if len(df_conf) >= 5:
-                corr_moe, p_moe = _sp_corr(df_conf['confidence'], df_conf['moe_ndcg'])
-                corr_boost, p_boost = _sp_corr(df_conf['confidence'], df_conf['reranker_boost'])
-                bucket_lines.append(f"Spearman(confidence, moe_ndcg)       = {corr_moe:+.4f}  (p={p_moe:.4e})")
-                bucket_lines.append(f"Spearman(confidence, reranker_boost) = {corr_boost:+.4f}  (p={p_boost:.4e})")
-                bucket_lines.append("=" * 80)
-
-            conf_analysis = "\n".join(bucket_lines)
-            print(f"\n{conf_analysis}")
-
-            # Save to file
-            conf_txt = os.path.join(output_dir, 'confidence_ndcg_analysis.txt')
-            with open(conf_txt, 'w', encoding='utf-8') as f:
-                f.write(conf_analysis + "\n")
-            print(f"✅ Saved confidence analysis text: {conf_txt}")
-        # ── END CONFIDENCE ANALYSIS ──────────────────────────────────────
 
     save_final_metrics(args, total, final_hit1, final_hit3, final_hit5, final_tot_ndcg)
     
